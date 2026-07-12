@@ -1,0 +1,120 @@
+name: katabump-renew
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 */6 * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: katabump-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    name: Renew accounts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      USERS_JSON: ${{ secrets.USERS_JSON }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      IS_PROXY: ${{ vars.IS_PROXY || 'false' }}
+      PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
+          install-dependencies: true
+
+      - name: Show runtime info
+        run: |
+          python --version
+          google-chrome --version || true
+          chromedriver --version || true
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install seleniumbase requests
+
+      - name: Prepare output directories
+        run: |
+          mkdir -p output/screenshots
+
+      - name: Run renew script
+        run: |
+          xvfb-run -a python renew.py
+
+      - name: Upload reports and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: katabump-report-${{ github.run_id }}
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 1
+
+  cleanup:
+    name: Cleanup old runs
+    if: always()
+    needs: [renew]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      WORKFLOW_NAME: katabump-renew
+      KEEP_RUNS: "5"
+
+    steps:
+      - name: Delete old workflow runs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh run list \
+            --repo "$REPO" \
+            --workflow "$WORKFLOW_NAME" \
+            --limit 100 \
+            --json databaseId,createdAt,status,conclusion \
+            --jq 'sort_by(.createdAt) | reverse | .[].databaseId' > runs.txt
+
+          total=$(wc -l < runs.txt | tr -d ' ')
+          echo "Total runs: $total"
+          echo "Keep runs: $KEEP_RUNS"
+
+          if [ "$total" -le "$KEEP_RUNS" ]; then
+            echo "No old runs to delete."
+            exit 0
+          fi
+
+          tail -n +$((KEEP_RUNS + 1)) runs.txt | while read -r run_id; do
+            [ -n "$run_id" ] || continue
+            echo "Deleting run: $run_id"
+            gh run delete "$run_id" --repo "$REPO" || true
+            sleep 1
+          done
