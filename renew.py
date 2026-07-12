@@ -329,14 +329,37 @@ def handle_turnstile(sb) -> bool:
         diag = sb.execute_script("""
             (function(){
                 var i = document.querySelector('input[name="cf-turnstile-response"]');
-                return {
+                var info = {
                     has_input: !!i,
                     token_len: i ? (i.value || '').length : -1,
                     title: document.title
                 };
+                // 点击点实际命中的元素
+                var el = document.elementFromPoint(21, 142);
+                info.hit_tag = el ? el.tagName : null;
+                info.hit_class = el ? (el.className || '') : null;
+                info.hit_in_iframe = !!(el && el.tagName === 'IFRAME');
+                // Turnstile iframe 详情
+                var iframes = document.querySelectorAll('iframe');
+                info.iframe_count = iframes.length;
+                for (var k = 0; k < iframes.length; k++) {
+                    var f = iframes[k];
+                    var r = f.getBoundingClientRect();
+                    if (f.src && f.src.indexOf('challenges.cloudflare.com') >= 0) {
+                        info.ts_rect = {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)};
+                        info.ts_src = f.src.slice(0, 80);
+                    }
+                }
+                // 页面可见的 verify / error 提示
+                var txt = (document.body.innerText || '').slice(0, 300);
+                info.page_text = txt;
+                return info;
             })()
         """)
         print(f"     Turnstile input 存在: {diag.get('has_input')}, token 长度: {diag.get('token_len')}, 标题: {diag.get('title')}")
+        print(f"     点击点(21,142)命中元素: tag={diag.get('hit_tag')}, class={diag.get('hit_class')}, 在iframe内={diag.get('hit_in_iframe')}")
+        print(f"     iframe 数量: {diag.get('iframe_count')}, Turnstile rect: {diag.get('ts_rect')}, src: {diag.get('ts_src')}")
+        print(f"     页面文本片段: {diag.get('page_text')}")
     except Exception as e:
         print(f"     诊断获取异常: {e}")
     sb.save_screenshot("turnstile_fail.png")
