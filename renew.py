@@ -8,6 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 from enum import Enum
+
 import requests
 from seleniumbase import SB
 
@@ -140,9 +141,7 @@ def send_tg_text(text: str):
     total = len(parts)
 
     for idx, part in enumerate(parts, start=1):
-        final_text = part
-        if total > 1:
-            final_text = f"[{idx}/{total}]\n{part}"
+        final_text = part if total == 1 else f"[{idx}/{total}]\n{part}"
         _send_tg_text_once(final_text)
         if idx < total:
             time.sleep(1.2)
@@ -415,8 +414,22 @@ def _xdotool_click(x: int, y: int):
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
 
 
-def handle_turnstile(sb) -> bool:
-    print("🔍 处理 Cloudflare Turnstile 验证...")
+def open_login_page(sb):
+    print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
+    mode = "uc"
+    try:
+        sb.activate_cdp_mode(BASE_URL + "/auth/login")
+        mode = "cdp"
+        print("✅ 已切换到 CDP Mode")
+    except Exception as e:
+        print(f"⚠️ CDP Mode 打开失败，回退 UC Mode: {e}")
+        sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
+    time.sleep(6)
+    return mode
+
+
+def handle_turnstile(sb, mode="uc") -> bool:
+    print(f"🔍 处理 Cloudflare Turnstile 验证... (mode={mode})")
     time.sleep(2)
 
     if sb.execute_script(_SOLVED_JS):
@@ -430,10 +443,33 @@ def handle_turnstile(sb) -> bool:
             pass
         time.sleep(0.5)
 
+    cdp_selectors = [
+        "#turnstile-widget div",
+        "iframe[src*='challenges.cloudflare.com']",
+        "div.cf-turnstile",
+        "[name='cf-turnstile-response']",
+    ]
+
     for attempt in range(6):
         if sb.execute_script(_SOLVED_JS):
-            print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
+            print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试前检测）")
             return True
+
+        if mode == "cdp":
+            print(f"🧭 第 {attempt + 1} 次尝试 CDP 点击...")
+            for sel in cdp_selectors:
+                try:
+                    sb.cdp.gui_click_element(sel)
+                    print(f"✅ CDP 点击选择器成功: {sel}")
+                    break
+                except Exception as e:
+                    print(f"⚠️ CDP 点击失败 {sel}: {e}")
+
+            for _ in range(8):
+                time.sleep(0.5)
+                if sb.execute_script(_SOLVED_JS):
+                    print(f"✅ Turnstile 通过（CDP，第 {attempt + 1} 次）")
+                    return True
 
         print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
         try:
@@ -441,10 +477,22 @@ def handle_turnstile(sb) -> bool:
         except Exception as e:
             print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
 
-        for _ in range(16):
+        for _ in range(8):
             time.sleep(0.5)
             if sb.execute_script(_SOLVED_JS):
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
+                print(f"✅ Turnstile 通过（click，第 {attempt + 1} 次）")
+                return True
+
+        print(f"⌨️ 第 {attempt + 1} 次调用 uc_gui_handle_captcha...")
+        try:
+            sb.uc_gui_handle_captcha()
+        except Exception as e:
+            print(f"⚠️ uc_gui_handle_captcha 调用异常: {e}")
+
+        for _ in range(8):
+            time.sleep(0.5)
+            if sb.execute_script(_SOLVED_JS):
+                print(f"✅ Turnstile 通过（handle，第 {attempt + 1} 次）")
                 return True
 
         print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
@@ -458,9 +506,7 @@ def login(sb, user) -> bool:
     password = user["password"]
     file_tag = safe_name(username)
 
-    print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
-    sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
-    time.sleep(6)
+    mode = open_login_page(sb)
 
     print("⏳ 等待 Cloudflare 验证通过...")
     cf_passed = False
@@ -468,9 +514,10 @@ def login(sb, user) -> bool:
         page_src = sb.get_page_source() or ""
         if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
             cf_passed = True
-            print(f"✅ Cloudflare 验证已通过（{i + 1}s）")
+            print(f"✅ Cloudflare 验证已通过或页面已显示表单（{i + 1}s）")
             break
         time.sleep(1)
+
     if not cf_passed:
         print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
 
@@ -497,10 +544,20 @@ def login(sb, user) -> bool:
         pass
 
     print(f"📧 填写邮箱: {mask_email(username)}")
+    try:
+        if mode == "cdp":
+            sb.cdp.gui_click_element('input[name="email"]')
+    except Exception:
+        pass
     js_fill_input(sb, 'input[name="email"]', username)
     time.sleep(0.3)
 
     print("🔑 填写密码...")
+    try:
+        if mode == "cdp":
+            sb.cdp.gui_click_element('input[name="password"]')
+    except Exception:
+        pass
     js_fill_input(sb, 'input[name="password"]', password)
     time.sleep(1)
 
@@ -514,18 +571,40 @@ def login(sb, user) -> bool:
         time.sleep(1)
 
     if ts_found:
-        if not handle_turnstile(sb):
+        if not handle_turnstile(sb, mode=mode):
             print("❌ 登录界面的 Turnstile 验证失败")
             save_shot(sb, f"login_turnstile_fail_{file_tag}.png")
             return False
     else:
         print("ℹ️ 未检测到 Turnstile")
 
-    print("🖱️ 敲击回车提交表单...")
-    sb.press_keys('input[name="password"]', '\n')
+    print("🖱️ 提交登录表单...")
+    submitted = False
+
+    if mode == "cdp":
+        submit_selectors = [
+            'button[type="submit"]',
+            'form button[type="submit"]',
+            'button.btn-primary',
+        ]
+        for sel in submit_selectors:
+            try:
+                sb.cdp.gui_click_element(sel)
+                print(f"✅ 通过 CDP 点击提交按钮: {sel}")
+                submitted = True
+                break
+            except Exception as e:
+                print(f"⚠️ CDP 提交点击失败 {sel}: {e}")
+
+    if not submitted:
+        try:
+            sb.press_keys('input[name="password"]', '\n')
+            submitted = True
+        except Exception as e:
+            print(f"⚠️ 回车提交失败: {e}")
 
     print("⏳ 等待登录跳转...")
-    for _ in range(12):
+    for _ in range(15):
         time.sleep(1)
         cur_url = sb.get_current_url().split('?')[0].lower()
         page_title = sb.get_title() or ""
@@ -534,6 +613,7 @@ def login(sb, user) -> bool:
 
     cur_url = sb.get_current_url().split('?')[0].lower()
     page_title = sb.get_title() or ""
+
     if cur_url.startswith(f"{BASE_URL}/dashboard") or "dashboard" in page_title.lower():
         print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
         return True
@@ -854,6 +934,7 @@ def run_for_user(user, sb_kwargs):
             RenewStatus.RENEW_FAILED: "续期失败",
             RenewStatus.SCRIPT_ERROR: "脚本异常",
         }
+
         send_account_tg_message(
             username,
             icon_map[result["status"]],
@@ -865,7 +946,7 @@ def run_for_user(user, sb_kwargs):
 
 def main():
     print("#" * 25)
-    print("katabump 多账号自动登录续期")
+    print("katabump 多账号自动登录续期（CDP优先）")
     print("#" * 25)
 
     users = load_users()
@@ -873,7 +954,13 @@ def main():
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-    sb_kwargs = {"uc": True, "headless": False}
+
+    sb_kwargs = {
+        "uc": True,
+        "headless": False,
+        "xvfb": True,
+        "xvfb_metrics": "1366,768",
+    }
 
     if is_proxy:
         print(f"🔗 挂载代理: {proxy_str}")
