@@ -21,6 +21,7 @@ jobs:
 
     env:
       USERS_JSON: ${{ secrets.USERS_JSON }}
+      SUB_URL: ${{ secrets.SUB_URL }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       IS_PROXY: ${{ vars.IS_PROXY || 'false' }}
