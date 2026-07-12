@@ -259,7 +259,9 @@ _TURNSTILE_COORDS_JS = """
 # 无需可见/聚焦窗口即可在 CI 中命中 Shadow DOM 内的 checkbox。
 _TURNSTILE_HOOK_JS = """
 (function() {
-    if (window.self === window.top) return;
+    // 注意: 不要跳过顶层框架。部分站点把 Turnstile checkbox 渲染在
+    // 主文档自身的 Shadow DOM（<div class="cf-turnstile"> 内），而非跨域 iframe，
+    // 因此顶层框架也必须 hook attachShadow 才能捕获位置。
     try {
         function getRandomInt(min, max){return Math.floor(Math.random()*(max-min+1))+min;}
         var sx = getRandomInt(800,1200), sy = getRandomInt(400,600);
@@ -336,12 +338,18 @@ def _find_turnstile_target(sb):
     best_box = None
     for iframe in sb.find_elements("iframe"):
         try:
+            box = iframe.rect
+        except Exception:
+            box = {}
+        # 跳过 Cloudflare 隐藏的 1x1 token iframe，避免无谓的跨域切换
+        if box.get("width", 0) <= 2 and box.get("height", 0) <= 2:
+            continue
+        try:
             sb.driver.switch_to.frame(iframe)
             try:
                 data = sb.execute_script("return window.__turnstile_data || null")
             finally:
                 sb.driver.switch_to.default_content()
-            box = iframe.rect
             if data and "xRatio" in data:
                 return data, box
             if best_box is None and box.get("width", 0) > 0:
@@ -354,6 +362,27 @@ def _find_turnstile_target(sb):
     if best_box is not None:
         return None, best_box
     return None, None
+
+
+def _read_top_turnstile_coords(sb):
+    """读取主文档(顶层框架)内 window.__turnstile_data，按视口尺寸算出点击坐标。
+    适用于 checkbox 渲染在主文档 Shadow DOM 的站点。"""
+    try:
+        res = sb.execute_script("""
+            (function(){
+                var d = window.__turnstile_data || null;
+                if (!d || typeof d.xRatio !== 'number') return null;
+                return {
+                    x: d.xRatio * window.innerWidth,
+                    y: d.yRatio * window.innerHeight
+                };
+            })()
+        """)
+        if res and "x" in res:
+            return res["x"], res["y"]
+    except Exception:
+        pass
+    return None
 
 
 def _altcha_checkbox_coords(sb):
@@ -409,23 +438,30 @@ def handle_turnstile(sb) -> bool:
         try: _scroll_turnstile_into_view(sb)
         except Exception: pass
 
-        data, box = _find_turnstile_target(sb)
-        if data and box:
-            clickX = box["x"] + box["width"] * data["xRatio"]
-            clickY = box["y"] + box["height"] * data["yRatio"]
-            print(f"🖱️ CDP 点击 Turnstile ({clickX:.1f},{clickY:.1f}) [尝试 {attempt + 1}]")
-            _cdp_click(sb, clickX, clickY)
-        elif box:
-            # 取不到内部比例时，回退为点击 iframe 中心
-            print(f"🖱️ CDP 点击 Turnstile iframe 中心 [尝试 {attempt + 1}]")
-            _cdp_click(sb, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        # 优先: checkbox 在主文档 Shadow DOM（顶层框架）
+        top = _read_top_turnstile_coords(sb)
+        if top:
+            print(f"🖱️ CDP 点击 Turnstile 主文档 checkbox ({top[0]:.1f},{top[1]:.1f}) [尝试 {attempt + 1}]")
+            _cdp_click(sb, top[0], top[1])
         else:
-            # 完全取不到坐标时回退到 SeleniumBase 内置点击
-            print("⚠️ 未取得 Turnstile iframe，回退 uc_gui_click_captcha [尝试 {0}]".format(attempt + 1))
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception as e:
-                print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
+            # 回退: checkbox 在跨域 iframe 内
+            data, box = _find_turnstile_target(sb)
+            if data and box:
+                clickX = box["x"] + box["width"] * data["xRatio"]
+                clickY = box["y"] + box["height"] * data["yRatio"]
+                print(f"🖱️ CDP 点击 Turnstile ({clickX:.1f},{clickY:.1f}) [尝试 {attempt + 1}]")
+                _cdp_click(sb, clickX, clickY)
+            elif box:
+                # 取不到内部比例时，回退为点击 iframe 中心
+                print(f"🖱️ CDP 点击 Turnstile iframe 中心 [尝试 {attempt + 1}]")
+                _cdp_click(sb, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            else:
+                # 完全取不到坐标时回退到 SeleniumBase 内置点击
+                print("⚠️ 未取得 Turnstile 坐标，回退 uc_gui_click_captcha [尝试 {0}]".format(attempt + 1))
+                try:
+                    sb.uc_gui_click_captcha()
+                except Exception as e:
+                    print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
 
         # 等待验证结果（最多 8 秒）
         for _ in range(16):
