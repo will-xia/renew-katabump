@@ -20,7 +20,7 @@ from seleniumbase import SB
 
 BASE_URL = "https://dashboard.katabump.com"
 
-# GitHub Actions Secrets / 环境变量
+# 从 GitHub Actions Secrets / 环境变量读取
 USERS_JSON = os.environ.get("USERS_JSON", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
@@ -28,14 +28,10 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip()
 
-# UC 模式不要 headless；外层 xvfb-run 提供 DISPLAY
+# workflow 使用：xvfb-run -a python renew.py
+# 因此不使用 SeleniumBase 内部 Xvfb，也不运行 Chrome headless。
 HEADLESS = False
-
-# 关键：workflow 已经使用 xvfb-run -a python renew.py，
-# 所以 SeleniumBase 不能再启动自己的 Xvfb。
 USE_XVFB = False
-
-XVFB_METRICS = "1366,768"
 
 REPORT_DIR = Path("output")
 SCREENSHOT_DIR = REPORT_DIR / "screenshots"
@@ -47,7 +43,7 @@ SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# 状态与数据结构
+# 数据结构
 # ============================================================
 
 class RenewStatus(str, Enum):
@@ -78,7 +74,7 @@ class AccountResult:
 # ============================================================
 
 def now_bj() -> str:
-    """返回北京时间 UTC+8。"""
+    """返回 UTC+8 时间。"""
     return time.strftime(
         "%Y-%m-%d %H:%M:%S",
         time.gmtime(time.time() + 8 * 3600),
@@ -86,14 +82,14 @@ def now_bj() -> str:
 
 
 def safe_name(value: str) -> str:
-    """将字符串转换成安全文件名片段。"""
+    """转为安全的文件名片段。"""
     value = value.strip().lower()
     value = re.sub(r"[^a-z0-9._-]+", "_", value)
     return value[:96] or "unknown"
 
 
 def mask_email(email: str) -> str:
-    """邮箱脱敏：用户名前后各保留两位。"""
+    """邮箱脱敏。"""
     if not email:
         return "****"
 
@@ -110,15 +106,15 @@ def mask_email(email: str) -> str:
 
 def load_accounts() -> list[Account]:
     """
-    从 USERS_JSON 环境变量读取账号列表。
+    USERS_JSON 格式：
 
-    示例：
     [
       {"username":"user1@example.com","password":"password1"},
       {"username":"user2@example.com","password":"password2"}
     ]
 
-    兼容 email 作为 username：
+    同时兼容 email 字段：
+
     [
       {"email":"user@example.com","password":"password"}
     ]
@@ -129,16 +125,16 @@ def load_accounts() -> list[Account]:
     try:
         raw_accounts = json.loads(USERS_JSON)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"USERS_JSON 格式不合法：{exc}") from exc
+        raise ValueError(f"USERS_JSON 不是合法 JSON：{exc}") from exc
 
     if not isinstance(raw_accounts, list) or not raw_accounts:
         raise ValueError("USERS_JSON 必须是非空 JSON 数组。")
 
-    accounts = []
+    accounts: list[Account] = []
 
     for index, raw in enumerate(raw_accounts, start=1):
         if not isinstance(raw, dict):
-            raise ValueError(f"第 {index} 个账号不是对象。")
+            raise ValueError(f"第 {index} 个账号不是 JSON 对象。")
 
         username = str(raw.get("username") or raw.get("email") or "").strip()
         password = str(raw.get("password") or "")
@@ -155,21 +151,21 @@ def load_accounts() -> list[Account]:
 
 
 def save_screenshot(sb, username: str, label: str) -> str:
-    """保存截图，失败不影响主流程。"""
+    """保存截图。"""
     filename = (
         f"{safe_name(username)}_"
         f"{safe_name(label)}_"
         f"{time.strftime('%Y%m%d_%H%M%S')}.png"
     )
-    file_path = SCREENSHOT_DIR / filename
+    path = SCREENSHOT_DIR / filename
 
     try:
-        sb.save_screenshot(str(file_path))
-        print(f"📸 已保存截图：{file_path}")
+        sb.save_screenshot(str(path))
+        print(f"📸 已保存截图：{path}")
     except Exception as exc:
         print(f"⚠️ 截图保存失败：{exc}")
 
-    return str(file_path)
+    return str(path)
 
 
 # ============================================================
@@ -177,31 +173,31 @@ def save_screenshot(sb, username: str, label: str) -> str:
 # ============================================================
 
 def split_tg_text(text: str, limit: int = 3500) -> list[str]:
-    """按换行优先切分 Telegram 长消息。"""
+    """将 Telegram 长消息切分。"""
     if len(text) <= limit:
         return [text]
 
-    chunks = []
-    remaining = text
+    chunks: list[str] = []
+    remain = text
 
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
+    while remain:
+        if len(remain) <= limit:
+            chunks.append(remain)
             break
 
-        position = remaining.rfind("\n", 0, limit)
+        split_pos = remain.rfind("\n", 0, limit)
 
-        if position < limit // 2:
-            position = limit
+        if split_pos < limit // 2:
+            split_pos = limit
 
-        chunks.append(remaining[:position].rstrip())
-        remaining = remaining[position:].lstrip()
+        chunks.append(remain[:split_pos].rstrip())
+        remain = remain[split_pos:].lstrip()
 
     return chunks
 
 
 def send_tg_text(text: str):
-    """发送 Telegram 文本消息。"""
+    """推送 Telegram 消息。"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 通知。")
         return
@@ -220,7 +216,7 @@ def send_tg_text(text: str):
             )
 
             if response.status_code == 200:
-                print(f"📩 Telegram 通知已发送（第 {index} 段）。")
+                print(f"📩 Telegram 已发送（第 {index} 段）。")
             else:
                 print(
                     f"⚠️ Telegram 发送失败："
@@ -254,27 +250,29 @@ def status_text(status: RenewStatus) -> str:
 
 
 def send_account_notification(result: AccountResult):
-    """发送单账号处理结果。"""
-    text = (
+    """发送单账号结果通知。"""
+    message = (
         "🇫🇷 KataBump 续期通知\n\n"
         f"{status_icon(result.status)} {status_text(result.status)}\n"
         f"👤 账号：{mask_email(result.username)}\n"
         f"⏱️ 时间：{result.timestamp}\n"
         f"📝 详情：{result.message[:1500]}"
     )
-    send_tg_text(text)
+    send_tg_text(message)
 
 
 # ============================================================
-# 页面 JavaScript
+# JavaScript 工具
 # ============================================================
 
 TURNSTILE_EXISTS_JS = """
 (function() {
     return Boolean(
         document.querySelector('input[name="cf-turnstile-response"]') ||
-        document.querySelector('.cf-turnstile') ||
-        document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+        document.querySelector(".cf-turnstile") ||
+        document.querySelector(
+            'iframe[src*="challenges.cloudflare.com"]'
+        )
     );
 })();
 """
@@ -295,14 +293,14 @@ TURNSTILE_SOLVED_JS = """
 
 MODAL_VERIFICATION_EXISTS_JS = """
 (function() {
-    var modal = document.querySelector('div.modal.show');
+    var modal = document.querySelector("div.modal.show");
 
     if (!modal) {
         return false;
     }
 
     return Boolean(
-        modal.querySelector('iframe') ||
+        modal.querySelector("iframe") ||
         modal.querySelector('input[type="checkbox"]') ||
         modal.querySelector('[class*="altcha"]') ||
         modal.querySelector('[class*="captcha"]') ||
@@ -310,18 +308,6 @@ MODAL_VERIFICATION_EXISTS_JS = """
         modal.querySelector('[name*="captcha"]')
     );
 })();
-"""
-
-SCROLL_TO_ELEMENT_JS = """
-(function(element) {
-    if (element) {
-        element.scrollIntoView({
-            behavior: "instant",
-            block: "center",
-            inline: "nearest"
-        });
-    }
-})(arguments[0]);
 """
 
 
@@ -348,28 +334,36 @@ def modal_requires_verification(sb) -> bool:
 
 def js_fill_input(sb, selector: str, value: str) -> bool:
     """
-    通过原生 HTMLInputElement value setter 写入输入框。
+    通过 JS 填写输入框。
 
-    所有 return 均在 IIFE 内部，修复 SeleniumBase/CDP 下：
-    SyntaxError: Illegal return statement
+    关键点：
+    - 不使用 arguments[0] / arguments[1]；
+    - 不向 execute_script() 传 Python 参数；
+    - selector、value 使用 json.dumps() 安全嵌入 JS；
+    - 所有 return 均在 IIFE 内部。
     """
-    script = """
-    (function(selector, value) {
+    selector_js = json.dumps(selector, ensure_ascii=False)
+    value_js = json.dumps(value, ensure_ascii=False)
+
+    script = f"""
+    (function() {{
+        var selector = {selector_js};
+        var value = {value_js};
         var element = document.querySelector(selector);
 
-        if (!element) {
-            return {
+        if (!element) {{
+            return {{
                 ok: false,
                 reason: "element_not_found"
-            };
-        }
+            }};
+        }}
 
-        try {
-            element.scrollIntoView({
+        try {{
+            element.scrollIntoView({{
                 behavior: "instant",
                 block: "center",
                 inline: "nearest"
-            });
+            }});
 
             element.focus();
 
@@ -378,40 +372,41 @@ def js_fill_input(sb, selector: str, value: str) -> bool:
                 "value"
             );
 
-            if (descriptor && descriptor.set) {
+            if (descriptor && descriptor.set) {{
                 descriptor.set.call(element, value);
-            } else {
+            }} else {{
                 element.value = value;
-            }
+            }}
 
-            element.dispatchEvent(new Event("input", {
+            element.dispatchEvent(new Event("input", {{
                 bubbles: true
-            }));
+            }}));
 
-            element.dispatchEvent(new Event("change", {
+            element.dispatchEvent(new Event("change", {{
                 bubbles: true
-            }));
+            }}));
 
-            element.dispatchEvent(new Event("blur", {
+            element.dispatchEvent(new Event("blur", {{
                 bubbles: true
-            }));
+            }}));
 
-            return {
+            return {{
                 ok: true,
                 actual_value: element.value
-            };
-        } catch (error) {
-            return {
+            }};
+        }} catch (error) {{
+            return {{
                 ok: false,
                 reason: String(error)
-            };
-        }
-    })(arguments[0], arguments[1]);
+            }};
+        }}
+    }})();
     """
 
     try:
-        result = sb.execute_script(script, selector, value)
+        result = sb.execute_script(script)
 
+        # 常规 Selenium / SeleniumBase 模式可能返回 dict。
         if isinstance(result, dict):
             if result.get("ok"):
                 print(f"✅ 已填写：{selector}")
@@ -420,11 +415,29 @@ def js_fill_input(sb, selector: str, value: str) -> bool:
             print(f"⚠️ 填写输入框失败 {selector}：{result}")
             return False
 
-        if result is True:
+        # CDP evaluate 有时不能正常返回对象；
+        # 再次读取输入框 value，以真实页面状态为准。
+        verify_script = f"""
+        (function() {{
+            var element = document.querySelector({selector_js});
+
+            return Boolean(
+                element &&
+                element.value === {value_js}
+            );
+        }})();
+        """
+
+        verified = bool(sb.execute_script(verify_script))
+
+        if verified:
             print(f"✅ 已填写：{selector}")
             return True
 
-        print(f"⚠️ 填写输入框失败 {selector}：返回值 {result}")
+        print(
+            f"⚠️ 填写输入框失败 {selector}："
+            f"脚本返回 {result}，且页面值校验失败。"
+        )
         return False
 
     except Exception as exc:
@@ -432,8 +445,27 @@ def js_fill_input(sb, selector: str, value: str) -> bool:
         return False
 
 
+def scroll_to_element(sb, element):
+    """
+    使用 SeleniumBase / WebDriver 的元素滚动，
+    不使用 arguments[0] 传入 JS。
+    """
+    try:
+        sb.scroll_to(element)
+        time.sleep(0.3)
+        return
+    except Exception:
+        pass
+
+    try:
+        element.location_once_scrolled_into_view
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+
 def close_cookie_banner(sb):
-    """尝试关闭 Cookie 弹窗。"""
+    """尽力关闭 Cookie 弹窗。"""
     selectors = [
         "button#onetrust-accept-btn-handler",
         "button[aria-label*='Accept']",
@@ -453,11 +485,11 @@ def close_cookie_banner(sb):
 
     try:
         for button in sb.find_elements("button"):
-            button_text = (button.text or "").strip().lower()
+            text = (button.text or "").strip().lower()
 
-            if button_text in {"accept", "accept all", "allow all"}:
+            if text in {"accept", "accept all", "allow all"}:
                 button.click()
-                print("🍪 已通过文本关闭 Cookie 弹窗。")
+                print("🍪 已通过按钮文本关闭 Cookie 弹窗。")
                 time.sleep(0.5)
                 return
     except Exception:
@@ -465,7 +497,7 @@ def close_cookie_banner(sb):
 
 
 def read_alert(sb) -> str:
-    """读取页面的 Bootstrap 或 ARIA alert。"""
+    """读取页面 alert 文本。"""
     selectors = [
         "div.alert",
         "[role='alert']",
@@ -491,7 +523,7 @@ def read_alert(sb) -> str:
 
 def wait_login_form_or_turnstile(sb, timeout: int = 30) -> str:
     """
-    等待登录页面。
+    等待登录表单或验证码。
 
     返回：
     - login_form
@@ -516,28 +548,34 @@ def wait_login_form_or_turnstile(sb, timeout: int = 30) -> str:
 
 
 def login(sb, account: Account) -> tuple[RenewStatus, str]:
-    """登录 KataBump。"""
-    username = account.username
-
+    """登录账号。"""
     print(f"🌐 打开登录页面：{BASE_URL}/auth/login")
 
     try:
         sb.open(f"{BASE_URL}/auth/login")
         time.sleep(5)
     except Exception as exc:
-        return RenewStatus.LOGIN_FAILED, f"打开登录页失败：{exc}"
+        return RenewStatus.LOGIN_FAILED, f"打开登录页面失败：{exc}"
 
-    state = wait_login_form_or_turnstile(sb, timeout=30)
+    page_state = wait_login_form_or_turnstile(sb, timeout=30)
 
-    if state == "turnstile":
-        screenshot = save_screenshot(sb, username, "login_turnstile")
+    if page_state == "turnstile":
+        screenshot = save_screenshot(
+            sb,
+            account.username,
+            "login_turnstile",
+        )
         return (
             RenewStatus.NEEDS_MANUAL_VERIFICATION,
-            f"登录页出现 Turnstile，需要人工验证。截图：{screenshot}",
+            f"登录页面出现 Turnstile。截图：{screenshot}",
         )
 
-    if state == "timeout":
-        screenshot = save_screenshot(sb, username, "login_form_timeout")
+    if page_state == "timeout":
+        screenshot = save_screenshot(
+            sb,
+            account.username,
+            "login_form_timeout",
+        )
         return (
             RenewStatus.LOGIN_FAILED,
             f"等待登录表单超时。截图：{screenshot}",
@@ -545,9 +583,13 @@ def login(sb, account: Account) -> tuple[RenewStatus, str]:
 
     close_cookie_banner(sb)
 
-    print(f"📧 填写邮箱：{mask_email(username)}")
+    print(f"📧 填写邮箱：{mask_email(account.username)}")
     if not js_fill_input(sb, 'input[name="email"]', account.username):
-        screenshot = save_screenshot(sb, username, "email_input_failed")
+        screenshot = save_screenshot(
+            sb,
+            account.username,
+            "email_input_failed",
+        )
         return (
             RenewStatus.LOGIN_FAILED,
             f"无法填写邮箱输入框。截图：{screenshot}",
@@ -555,7 +597,11 @@ def login(sb, account: Account) -> tuple[RenewStatus, str]:
 
     print("🔑 填写密码")
     if not js_fill_input(sb, 'input[name="password"]', account.password):
-        screenshot = save_screenshot(sb, username, "password_input_failed")
+        screenshot = save_screenshot(
+            sb,
+            account.username,
+            "password_input_failed",
+        )
         return (
             RenewStatus.LOGIN_FAILED,
             f"无法填写密码输入框。截图：{screenshot}",
@@ -564,27 +610,30 @@ def login(sb, account: Account) -> tuple[RenewStatus, str]:
     time.sleep(1)
 
     if is_turnstile_present(sb) and not has_turnstile_token(sb):
-        screenshot = save_screenshot(sb, username, "turnstile_before_submit")
+        screenshot = save_screenshot(
+            sb,
+            account.username,
+            "turnstile_before_submit",
+        )
         return (
             RenewStatus.NEEDS_MANUAL_VERIFICATION,
-            f"提交登录前出现 Turnstile，需要人工验证。截图：{screenshot}",
+            f"提交前检测到 Turnstile。截图：{screenshot}",
         )
 
     print("🖱️ 提交登录表单")
 
     submitted = False
-    submit_selectors = [
+
+    for selector in [
         'form button[type="submit"]',
         'button[type="submit"]',
         'button.btn-primary',
-    ]
-
-    for selector in submit_selectors:
+    ]:
         try:
             if sb.is_element_visible(selector):
                 sb.click(selector)
-                submitted = True
                 print(f"✅ 已点击登录提交按钮：{selector}")
+                submitted = True
                 break
         except Exception:
             pass
@@ -592,13 +641,17 @@ def login(sb, account: Account) -> tuple[RenewStatus, str]:
     if not submitted:
         try:
             sb.press_keys('input[name="password"]', "\n")
-            submitted = True
             print("✅ 已通过回车提交登录表单。")
+            submitted = True
         except Exception as exc:
-            screenshot = save_screenshot(sb, username, "login_submit_failed")
+            screenshot = save_screenshot(
+                sb,
+                account.username,
+                "login_submit_failed",
+            )
             return (
                 RenewStatus.LOGIN_FAILED,
-                f"提交登录表单失败：{exc}；截图：{screenshot}",
+                f"提交登录失败：{exc}；截图：{screenshot}",
             )
 
     for second in range(1, 16):
@@ -616,28 +669,37 @@ def login(sb, account: Account) -> tuple[RenewStatus, str]:
             return RenewStatus.RENEW_SUCCESS, "登录成功"
 
         if is_turnstile_present(sb) and not has_turnstile_token(sb):
-            screenshot = save_screenshot(sb, username, "turnstile_after_submit")
+            screenshot = save_screenshot(
+                sb,
+                account.username,
+                "turnstile_after_submit",
+            )
             return (
                 RenewStatus.NEEDS_MANUAL_VERIFICATION,
-                f"提交登录后出现 Turnstile，需要人工验证。截图：{screenshot}",
+                f"登录提交后出现 Turnstile。截图：{screenshot}",
             )
 
-    screenshot = save_screenshot(sb, username, "login_failed")
+    screenshot = save_screenshot(
+        sb,
+        account.username,
+        "login_failed",
+    )
 
     return (
         RenewStatus.LOGIN_FAILED,
-        f"登录后未跳转至 Dashboard。截图：{screenshot}",
+        f"登录后未进入 Dashboard。截图：{screenshot}",
     )
 
 
 # ============================================================
-# 续期流程
+# 服务器续期流程
 # ============================================================
 
-def goto_server_detail(sb, account: Account) -> tuple[Optional[RenewStatus], str]:
-    """从 Dashboard 进入服务器详情页面。"""
-    username = account.username
-
+def goto_server_detail(
+    sb,
+    account: Account,
+) -> tuple[Optional[RenewStatus], str]:
+    """Dashboard -> 服务器详情页。"""
     print("\n🖥️ 正在进入服务器续期页...")
     time.sleep(4)
 
@@ -663,40 +725,41 @@ def goto_server_detail(sb, account: Account) -> tuple[Optional[RenewStatus], str
         for element in elements:
             try:
                 href = (element.get_attribute("href") or "").lower()
-                link_text = (element.text or "").strip().lower()
+                text = (element.text or "").strip().lower()
 
-                if "/servers/edit" not in href and link_text != "see":
+                if "/servers/edit" not in href and text != "see":
                     continue
 
                 print(f"✅ 找到服务器详情入口：{selector}")
 
-                try:
-                    sb.execute_script(SCROLL_TO_ELEMENT_JS, element)
-                except Exception:
-                    pass
-
-                time.sleep(0.5)
+                scroll_to_element(sb, element)
                 element.click()
-                time.sleep(4)
 
+                time.sleep(4)
                 print(f"📄 当前页面：{sb.get_current_url()}")
+
                 return None, "已进入服务器详情页"
 
             except Exception:
                 continue
 
-    screenshot = save_screenshot(sb, username, "server_detail_not_found")
+    screenshot = save_screenshot(
+        sb,
+        account.username,
+        "server_detail_not_found",
+    )
 
     return (
         RenewStatus.RENEW_FAILED,
-        f"未找到服务器详情入口 See。截图：{screenshot}",
+        f"未找到服务器详情页入口。截图：{screenshot}",
     )
 
 
-def open_renew_modal(sb, account: Account) -> tuple[Optional[RenewStatus], str]:
-    """点击 Renew 并打开续期模态框。"""
-    username = account.username
-
+def open_renew_modal(
+    sb,
+    account: Account,
+) -> tuple[Optional[RenewStatus], str]:
+    """服务器详情页 -> 打开 Renew 模态框。"""
     print("\n🔄 查找 Renew 按钮...")
 
     selectors = [
@@ -713,20 +776,15 @@ def open_renew_modal(sb, account: Account) -> tuple[Optional[RenewStatus], str]:
 
         for button in buttons:
             try:
-                button_text = (button.text or "").strip().lower()
+                text = (button.text or "").strip().lower()
 
                 if (
                     selector != 'button[data-bs-target="#renew-modal"]'
-                    and "renew" not in button_text
+                    and "renew" not in text
                 ):
                     continue
 
-                try:
-                    sb.execute_script(SCROLL_TO_ELEMENT_JS, button)
-                except Exception:
-                    pass
-
-                time.sleep(0.8)
+                scroll_to_element(sb, button)
                 button.click()
 
                 print("🖱️ 已点击 Renew，等待模态框...")
@@ -739,7 +797,11 @@ def open_renew_modal(sb, account: Account) -> tuple[Optional[RenewStatus], str]:
             except Exception:
                 continue
 
-    screenshot = save_screenshot(sb, username, "renew_modal_not_found")
+    screenshot = save_screenshot(
+        sb,
+        account.username,
+        "renew_modal_not_found",
+    )
 
     return (
         RenewStatus.RENEW_FAILED,
@@ -749,17 +811,14 @@ def open_renew_modal(sb, account: Account) -> tuple[Optional[RenewStatus], str]:
 
 def submit_renew(sb, account: Account) -> tuple[RenewStatus, str]:
     """
-    提交 Renew。
+    提交续期。
 
-    如果模态框内包含验证控件，则保存截图并停止该账号，
-    避免自动化处理或绕过网站的人机验证。
+    模态框内检测到验证控件时停止，避免自动化处理人机验证。
     """
-    username = account.username
-
     if modal_requires_verification(sb):
         screenshot = save_screenshot(
             sb,
-            username,
+            account.username,
             "renew_verification_required",
         )
 
@@ -776,17 +835,12 @@ def submit_renew(sb, account: Account) -> tuple[RenewStatus, str]:
         buttons = sb.find_elements("div.modal.show button")
 
         for button in buttons:
-            button_text = (button.text or "").strip().lower()
+            text = (button.text or "").strip().lower()
 
-            if "renew" not in button_text or "cancel" in button_text:
+            if "renew" not in text or "cancel" in text:
                 continue
 
-            try:
-                sb.execute_script(SCROLL_TO_ELEMENT_JS, button)
-            except Exception:
-                pass
-
-            time.sleep(0.5)
+            scroll_to_element(sb, button)
             button.click()
 
             clicked = True
@@ -799,7 +853,7 @@ def submit_renew(sb, account: Account) -> tuple[RenewStatus, str]:
     if not clicked:
         screenshot = save_screenshot(
             sb,
-            username,
+            account.username,
             "renew_submit_button_not_found",
         )
 
@@ -817,7 +871,11 @@ def submit_renew(sb, account: Account) -> tuple[RenewStatus, str]:
         alert_text = read_alert(sb)
 
     if not alert_text:
-        screenshot = save_screenshot(sb, username, "renew_result_unknown")
+        screenshot = save_screenshot(
+            sb,
+            account.username,
+            "renew_result_unknown",
+        )
 
         return (
             RenewStatus.RENEW_FAILED,
@@ -837,7 +895,7 @@ def submit_renew(sb, account: Account) -> tuple[RenewStatus, str]:
 
 
 def renew_server(sb, account: Account) -> tuple[RenewStatus, str]:
-    """登录成功后的自动续期主流程。"""
+    """完整续期流程。"""
     print("\n" + "#" * 50)
     print(f"开始续期：{mask_email(account.username)}")
     print("#" * 50)
@@ -856,20 +914,19 @@ def renew_server(sb, account: Account) -> tuple[RenewStatus, str]:
 
 
 # ============================================================
-# 账号调度
+# 浏览器与账号调度
 # ============================================================
 
 def build_sb_kwargs() -> dict:
-    """构造 SeleniumBase 浏览器启动参数。"""
+    """构建浏览器参数。"""
     kwargs = {
         "uc": True,
         "headless": HEADLESS,
     }
 
-    # 当前固定为 False；仅保留此逻辑以便日后本地运行时调整。
+    # 当前始终 false；外部 xvfb-run 管理虚拟显示。
     if USE_XVFB and not HEADLESS:
         kwargs["xvfb"] = True
-        kwargs["xvfb_metrics"] = XVFB_METRICS
 
     if IS_PROXY:
         proxy = PROXY_SERVER or "http://127.0.0.1:1081"
@@ -882,7 +939,7 @@ def build_sb_kwargs() -> dict:
 
 
 def print_exit_ip(sb):
-    """打印出口 IP；失败不终止脚本。"""
+    """打印当前出口 IP。"""
     try:
         sb.open("https://api.ip.sb/ip")
         time.sleep(1)
@@ -895,7 +952,7 @@ def print_exit_ip(sb):
 
 
 def run_account(account: Account, sb_kwargs: dict) -> AccountResult:
-    """为每个账号创建独立浏览器会话，串行执行。"""
+    """独立执行一个账号。"""
     print("\n" + "=" * 60)
     print(f"👤 开始处理：{mask_email(account.username)}")
     print("=" * 60)
@@ -912,7 +969,7 @@ def run_account(account: Account, sb_kwargs: dict) -> AccountResult:
     except Exception as exc:
         status = RenewStatus.SCRIPT_ERROR
         message = f"{type(exc).__name__}: {exc}"
-        print(f"💥 账号运行异常：{message}")
+        print(f"💥 账号执行异常：{message}")
 
     result = AccountResult(
         username=account.username,
@@ -922,8 +979,9 @@ def run_account(account: Account, sb_kwargs: dict) -> AccountResult:
     )
 
     print(
-        f"{status_icon(status)} {mask_email(account.username)} "
-        f"=> {status.value} | {message}"
+        f"{status_icon(result.status)} "
+        f"{mask_email(result.username)} => "
+        f"{result.status.value} | {result.message}"
     )
 
     send_account_notification(result)
@@ -936,7 +994,7 @@ def run_account(account: Account, sb_kwargs: dict) -> AccountResult:
 # ============================================================
 
 def build_summary(results: list[AccountResult]) -> str:
-    """生成控制台、TXT 与 TG 通用汇总文本。"""
+    """生成汇总文本。"""
     counts = {status: 0 for status in RenewStatus}
 
     for result in results:
@@ -971,10 +1029,10 @@ def build_summary(results: list[AccountResult]) -> str:
 
 
 def write_reports(results: list[AccountResult]):
-    """写入 JSON 和文本报告。"""
+    """写入 JSON 和 TXT 报告。"""
     summary = build_summary(results)
 
-    json_data = {
+    report_data = {
         "generated_at": now_bj(),
         "results": [
             {
@@ -989,7 +1047,7 @@ def write_reports(results: list[AccountResult]):
     }
 
     REPORT_JSON_FILE.write_text(
-        json.dumps(json_data, ensure_ascii=False, indent=2),
+        json.dumps(report_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -1009,7 +1067,7 @@ def write_reports(results: list[AccountResult]):
 def main():
     print("#" * 60)
     print("KataBump 多账号自动续期")
-    print("运行模式：外部 xvfb-run；SeleniumBase 内部 Xvfb 已禁用")
+    print("运行模式：外部 xvfb-run，内部 Xvfb 已禁用")
     print("#" * 60)
 
     accounts = load_accounts()
@@ -1021,7 +1079,8 @@ def main():
 
     for index, account in enumerate(accounts, start=1):
         print(f"\n🚀 处理第 {index}/{len(accounts)} 个账号")
-        results.append(run_account(account, sb_kwargs))
+        result = run_account(account, sb_kwargs)
+        results.append(result)
 
     write_reports(results)
 
