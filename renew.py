@@ -53,6 +53,15 @@ def setup_mihomo(sub_url: str) -> bool:
             _mihomo_log(f"下载失败: {e}")
             return False
 
+    # 1.5 检查二进制是否可执行
+    try:
+        result = subprocess.run(["file", MIHOMO_PATH], capture_output=True, text=True, timeout=5)
+        _mihomo_log(f"二进制信息: {result.stdout.strip()}")
+        result2 = subprocess.run([MIHOMO_PATH, "-v"], capture_output=True, text=True, timeout=5)
+        _mihomo_log(f"版本: {result2.stdout.strip()[:200]}")
+    except Exception as e:
+        _mihomo_log(f"二进制检查异常: {e}")
+
     # 2. 生成配置
     config_yaml = f"""
 mixed-port: {MIHOMO_MIXED_PORT}
@@ -83,7 +92,8 @@ rules:
     try:
         with open(MIHOMO_CONFIG, "w") as f:
             f.write(config_yaml)
-        _mihomo_log("配置已写入 config.yaml")
+        _mihomo_log(f"配置已写入 config.yaml ({len(config_yaml)} 字节)")
+        _mihomo_log(f"配置内容:\n{config_yaml[:500]}")
     except Exception as e:
         _mihomo_log(f"写入配置失败: {e}")
         return False
@@ -114,21 +124,46 @@ rules:
         _mihomo_log(f"启动失败: {e}")
         return False
 
-    # 5. 等待就绪
-    time.sleep(3)
-    try:
-        r = requests.get(f"{MIHOMO_CONTROLLER}/version", timeout=5)
-        _mihomo_log(f"Mihomo 版本: {r.text[:80]}")
-    except Exception:
-        _mihomo_log("⚠️ Mihomo 可能未就绪，继续尝试...")
+    # 5. 等待就绪（最多 15 秒）
+    mihomo_ready = False
+    for i in range(15):
+        time.sleep(1)
+        # 检查进程是否还活着
+        if _mihomo_proc and _mihomo_proc.poll() is not None:
+            _mihomo_log(f"⚠️ Mihomo 进程已退出 (code={_mihomo_proc.returncode})")
+            try:
+                with open(MIHOMO_LOG) as f:
+                    _mihomo_log(f"日志内容:\n{f.read()[:2000]}")
+            except Exception:
+                pass
+            return False
+        try:
+            r = requests.get(f"{MIHOMO_CONTROLLER}/version", timeout=2)
+            _mihomo_log(f"Mihomo 就绪 (耗时 {i+1}s)，版本: {r.text[:80]}")
+            mihomo_ready = True
+            break
+        except Exception:
+            if i % 5 == 4:
+                _mihomo_log(f"等待 Mihomo 就绪... ({i+1}s)")
 
-    # 6. 刷新 provider
-    try:
-        requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=10)
-        _mihomo_log("已刷新 provider")
-        time.sleep(2)
-    except Exception as e:
-        _mihomo_log(f"刷新 provider 失败: {e}")
+    if not mihomo_ready:
+        _mihomo_log("⚠️ Mihomo 15 秒内未就绪，打印日志:")
+        try:
+            with open(MIHOMO_LOG) as f:
+                _mihomo_log(f"日志内容:\n{f.read()[:2000]}")
+        except Exception:
+            pass
+        # 仍然尝试继续（可能 API 延迟绑定）
+
+    # 6. 刷新 provider（多等几秒确保完全就绪）
+    if mihomo_ready:
+        time.sleep(3)
+        try:
+            r = requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=15)
+            _mihomo_log(f"刷新 provider: {r.status_code}")
+            time.sleep(3)
+        except Exception as e:
+            _mihomo_log(f"刷新 provider 失败: {e}")
 
     return True
 
