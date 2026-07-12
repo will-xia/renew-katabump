@@ -9,6 +9,198 @@ import traceback
 import requests
 from seleniumbase import SB
 
+# ==========================================
+# ========== Mihomo 代理池模块 ==============
+# ==========================================
+MIHOMO_PATH = os.path.join(os.getcwd(), "mihomo")
+MIHOMO_CONFIG = os.path.join(os.getcwd(), "config.yaml")
+MIHOMO_LOG = os.path.join(os.getcwd(), "mihomo.log")
+MIHOMO_CONTROLLER = "http://127.0.0.1:9090"
+MIHOMO_MIXED_PORT = 7890
+MIHOMO_GROUP = "MyGroup"
+
+_mihomo_proc = None  # 用于退出时清理
+
+
+def _mihomo_log(msg):
+    print(f"[Mihomo] {msg}")
+    try:
+        with open(MIHOMO_LOG, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def setup_mihomo(sub_url: str) -> bool:
+    """下载 Mihomo 二进制、生成配置、启动代理引擎"""
+    global _mihomo_proc
+
+    if not sub_url:
+        return False
+
+    _mihomo_log(f"检测到 SUB_URL，准备启动代理池...")
+
+    # 1. 下载二进制（若不存在）
+    if not os.path.exists(MIHOMO_PATH):
+        _mihomo_log("下载 mihomo-linux-amd64...")
+        try:
+            url = "https://github.com/MetaCubeX/mihomo/releases/download/v1.18.9/mihomo-linux-amd64-v1.18.9.gz"
+            subprocess.run(["curl", "-L", "-o", "mihomo.gz", url], check=True, timeout=120)
+            subprocess.run(["gzip", "-d", "mihomo.gz"], check=True)
+            subprocess.run(["chmod", "+x", MIHOMO_PATH], check=True)
+            _mihomo_log("下载完成")
+        except Exception as e:
+            _mihomo_log(f"下载失败: {e}")
+            return False
+
+    # 2. 生成配置
+    config_yaml = f"""
+mixed-port: {MIHOMO_MIXED_PORT}
+allow-lan: false
+mode: rule
+log-level: debug
+external-controller: {MIHOMO_CONTROLLER}
+proxy-providers:
+  sub1:
+    type: http
+    url: "{sub_url}"
+    interval: 3600
+    path: ./sub1.yaml
+    headers:
+      User-Agent: ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"]
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+proxy-groups:
+  - name: {MIHOMO_GROUP}
+    type: select
+    use:
+      - sub1
+rules:
+  - MATCH,{MIHOMO_GROUP}
+"""
+    try:
+        with open(MIHOMO_CONFIG, "w") as f:
+            f.write(config_yaml)
+        _mihomo_log("配置已写入 config.yaml")
+    except Exception as e:
+        _mihomo_log(f"写入配置失败: {e}")
+        return False
+
+    # 3. 语法检查
+    try:
+        result = subprocess.run(
+            [MIHOMO_PATH, "-d", os.getcwd(), "-f", MIHOMO_CONFIG, "-t"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            _mihomo_log(f"配置语法错误: {result.stderr}")
+            return False
+        _mihomo_log("配置语法检查通过")
+    except Exception as e:
+        _mihomo_log(f"配置检查异常: {e}")
+
+    # 4. 启动 Mihomo
+    try:
+        with open(MIHOMO_LOG, "w") as log_f:
+            _mihomo_proc = subprocess.Popen(
+                [MIHOMO_PATH, "-d", os.getcwd(), "-f", MIHOMO_CONFIG],
+                stdout=log_f, stderr=log_f,
+                start_new_session=True
+            )
+        _mihomo_log(f"Mihomo 已启动 (PID={_mihomo_proc.pid})")
+    except Exception as e:
+        _mihomo_log(f"启动失败: {e}")
+        return False
+
+    # 5. 等待就绪
+    time.sleep(3)
+    try:
+        r = requests.get(f"{MIHOMO_CONTROLLER}/version", timeout=5)
+        _mihomo_log(f"Mihomo 版本: {r.text[:80]}")
+    except Exception:
+        _mihomo_log("⚠️ Mihomo 可能未就绪，继续尝试...")
+
+    # 6. 刷新 provider
+    try:
+        requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=10)
+        _mihomo_log("已刷新 provider")
+        time.sleep(2)
+    except Exception as e:
+        _mihomo_log(f"刷新 provider 失败: {e}")
+
+    return True
+
+
+def get_mihomo_proxies() -> list:
+    """从 Mihomo API 获取可用节点列表"""
+    try:
+        r = requests.get(f"{MIHOMO_CONTROLLER}/proxies/{MIHOMO_GROUP}", timeout=10)
+        data = r.json()
+        all_nodes = data.get("all", [])
+        # 过滤掉 DIRECT / REJECT / 组名自身
+        filtered = [n for n in all_nodes if n not in ("DIRECT", "REJECT", MIHOMO_GROUP)]
+        _mihomo_log(f"获取到 {len(filtered)} 个候选节点")
+        return filtered
+    except Exception as e:
+        _mihomo_log(f"获取节点列表失败: {e}")
+        return []
+
+
+def test_mihomo_proxies(proxy_names: list) -> list:
+    """并发测速，返回健康节点列表"""
+    _mihomo_log(f"开始对 {len(proxy_names)} 个节点测速...")
+    healthy = []
+    batch_size = 15
+    for i in range(0, len(proxy_names), batch_size):
+        batch = proxy_names[i:i + batch_size]
+        for name in batch:
+            try:
+                r = requests.get(
+                    f"{MIHOMO_CONTROLLER}/proxies/{requests.utils.quote(name, safe='')}/delay",
+                    params={"timeout": "3000", "url": "http://www.gstatic.com/generate_204"},
+                    timeout=5
+                )
+                data = r.json()
+                if data.get("delay"):
+                    healthy.append(name)
+            except Exception:
+                pass
+    _mihomo_log(f"测速完成，健康节点: {len(healthy)}/{len(proxy_names)}")
+    return healthy
+
+
+def switch_mihomo_proxy(name: str) -> bool:
+    """切换 Mihomo 活跃节点"""
+    try:
+        requests.put(
+            f"{MIHOMO_CONTROLLER}/proxies/{MIHOMO_GROUP}",
+            json={"name": name},
+            timeout=5
+        )
+        _mihomo_log(f"切换到节点: {name}")
+        return True
+    except Exception as e:
+        _mihomo_log(f"切换节点失败: {e}")
+        return False
+
+
+def stop_mihomo():
+    """停止 Mihomo 进程"""
+    global _mihomo_proc
+    if _mihomo_proc:
+        try:
+            _mihomo_proc.terminate()
+            _mihomo_proc.wait(timeout=5)
+            _mihomo_log("Mihomo 已停止")
+        except Exception:
+            try:
+                _mihomo_proc.kill()
+            except Exception:
+                pass
+        _mihomo_proc = None
+
 # 单账号回退配置（当未配置 USERS_JSON 时使用）
 EMAIL        = os.environ.get("KATABUMP_EMAIL") or ""    # 登录邮箱
 PASSWORD     = os.environ.get("KATABUMP_PASSWORD") or "" # 账号密码
@@ -893,7 +1085,7 @@ def renew_server(sb, email=EMAIL):
 
 #  脚本执行入口 (可选代理)
 def process_account(sb, user):
-    """处理单个账号的登录与续期"""
+    """处理单个账号的登录与续期，返回 (login_ok, renew_ok)"""
     email = user.get("username") or user.get("email") or ""
     password = user.get("password") or ""
     print("#" * 25)
@@ -901,13 +1093,15 @@ def process_account(sb, user):
     print("#" * 25)
     if not email or not password:
         print("⚠️ 账号缺少 username 或 password，跳过")
-        return
+        return False, False
 
-    if login(sb, email, password):
+    login_ok = login(sb, email, password)
+    if login_ok:
         renew_server(sb, email=email)
+        return True, True
     else:
-        print(f"\n❌ 账号 {email} 登录失败，终止后续续期操作。")
-        send_tg_message("❌", "登录失败", "未知", email=email)
+        print(f"\n❌ 账号 {email} 登录失败。")
+        return False, False
 
 
 def main():
@@ -921,46 +1115,125 @@ def main():
         return
     print(f"📋 共读取到 {len(users)} 个账号")
 
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    sub_url = os.environ.get("SUB_URL") or ""
+    is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
-    sb_kwargs = {"uc": True, "headless": False}
 
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
+    # 代理模式决策: SUB_URL 优先 → IS_PROXY → 直连
+    use_mihomo = False
+    proxy_pool = []
+    proxy_index = 0
+    max_retries = 1
+
+    if sub_url:
+        if setup_mihomo(sub_url):
+            use_mihomo = True
+            all_nodes = get_mihomo_proxies()
+            if all_nodes:
+                proxy_pool = test_mihomo_proxies(all_nodes)
+                if proxy_pool:
+                    import random
+                    random.shuffle(proxy_pool)
+                    _mihomo_log(f"可用节点: {len(proxy_pool)}")
+                    max_retries = min(5, len(proxy_pool))
+                else:
+                    _mihomo_log("⚠️ 无健康节点，使用直连")
+            else:
+                _mihomo_log("⚠️ 无节点可用，使用直连")
+        else:
+            print("⚠️ Mihomo 启动失败，回退直连")
+    elif is_proxy:
+        print(f"🔗 挂载单代理: {proxy_str}")
+        max_retries = 3
     else:
         print("🌐 未使用代理，直连访问")
 
+    stats = {"success": 0, "failed": 0, "skipped": 0}
+    total = len(users)
+
     for idx, user in enumerate(users, start=1):
+        email = user.get("username") or user.get("email") or ""
         print(f"\n{'=' * 25}")
-        print(f"  [{idx}/{len(users)}] 开始处理账号")
+        print(f"  [{idx}/{total}] {email}")
         print(f"{'=' * 25}")
-        # 每个账号使用独立浏览器会话，避免登录态串号
-        with SB(**sb_kwargs) as sb:
-            # 注入 Turnstile Shadow DOM 钩子（在每个新文档中生效，含跨域 iframe）
+
+        account_success = False
+        used_node = "DIRECT"
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                print(f"\n  [重试 {attempt + 1}/{max_retries}]")
+
+            # 切换代理节点
+            if use_mihomo and proxy_pool:
+                node_name = proxy_pool[proxy_index % len(proxy_pool)]
+                used_node = node_name
+                proxy_index += 1
+                switch_mihomo_proxy(node_name)
+                time.sleep(1)
+
+            # 构建浏览器参数
+            sb_kwargs = {"uc": True, "headless": False}
+            if use_mihomo:
+                sb_kwargs["proxy"] = f"http://127.0.0.1:{MIHOMO_MIXED_PORT}"
+            elif is_proxy:
+                sb_kwargs["proxy"] = proxy_str
+
+            with SB(**sb_kwargs) as sb:
+                # 注入钩子
+                try:
+                    sb.driver.execute_cdp_cmd(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": _TURNSTILE_HOOK_JS}
+                    )
+                except Exception:
+                    pass
+                try:
+                    sb.set_window_size(1280, 720)
+                except Exception:
+                    pass
+
+                # 检查出口 IP
+                try:
+                    sb.open("https://api.ip.sb/ip")
+                    ip = sb.get_text("body").strip()
+                    print(f"  📍 出口IP: {ip}")
+                except Exception:
+                    pass
+
+                # 执行登录 + 续期
+                try:
+                    login_ok, renew_ok = process_account(sb, user)
+                    if login_ok:
+                        account_success = True
+                        break  # 登录成功，不再重试
+                    # 登录失败可能是凭证问题，但也可能是节点问题
+                    # 如果有多个节点，继续重试
+                    if max_retries <= 1:
+                        break
+                except Exception as e:
+                    print(f"  ⚠️ 异常: {e}")
+                    traceback.print_exc()
+
+        if account_success:
+            stats["success"] += 1
+            print(f"  ✅ {email} 处理完成")
+        else:
+            stats["failed"] += 1
+            print(f"  ❌ {email} 全部 {max_retries} 次尝试失败")
             try:
-                sb.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _TURNSTILE_HOOK_JS})
-                print("✅ 已注入 Turnstile Shadow DOM 钩子")
-            except Exception as e:
-                print(f"⚠️ 注入 Turnstile 钩子失败: {e}")
-            # 固定视口，保证 CDP 点击坐标一致
-            try:
-                sb.set_window_size(1280, 720)
+                send_tg_message("❌", "全部失败", f"{max_retries}次尝试", email=email)
             except Exception:
                 pass
-            try:
-                sb.open("https://api.ip.sb/ip")
-                print(f"📍  当前出口IP: {sb.get_text('body')}")
-            except Exception:
-                pass
-            try:
-                process_account(sb, user)
-            except Exception as e:
-                print(f"⚠️ 账号处理异常: {e}")
-                traceback.print_exc()
-                send_tg_message("⚠️", "处理异常", str(e),
-                                email=user.get("username") or user.get("email") or "")
-        print(f"[{idx}/{len(users)}] 账号处理完毕，关闭浏览器")
+
+    # 汇总
+    print(f"\n{'=' * 40}")
+    print(f"📊 执行完毕: 总计 {total}, 成功 {stats['success']}, 失败 {stats['failed']}")
+    print(f"{'=' * 40}")
+
+    # 清理 Mihomo
+    if use_mihomo:
+        stop_mihomo()
 
 
 if __name__ == "__main__":
