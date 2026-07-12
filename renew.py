@@ -225,12 +225,6 @@ def _xdotool_click(x: int, y: int):
 #  人机验证处理（使用 SeleniumBase 内置 uc_gui_click_captcha）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
-    time.sleep(2)
-
-    # 检查是否已静默通过
-    if sb.execute_script(_SOLVED_JS):
-        print("✅ 已静默通过")
-        return True
 
     # 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
     for _ in range(3):
@@ -238,7 +232,18 @@ def handle_turnstile(sb) -> bool:
         except Exception: pass
         time.sleep(0.5)
 
-    # 使用 SeleniumBase 内置 uc_gui_click_captcha 处理 Turnstile
+    # 阶段 1: 隐形 Turnstile 通常会自动注入 cf-turnstile-response，无需点击。
+    # 先轮询等待 token 出现（最多 ~25 秒），这是 CI / 无显示环境下唯一可靠的通过方式。
+    print("⏳ 等待 Turnstile 自动通过（隐形验证，无需点击）...")
+    for i in range(25):
+        if sb.execute_script(_SOLVED_JS):
+            print(f"✅ Turnstile 已自动通过（{i+1}s）")
+            return True
+        time.sleep(1)
+
+    # 阶段 2: 若未自动通过（交互式挑战），再尝试物理点击。
+    # 注意: uc_gui_click_captcha 依赖真实可见窗口与鼠标，无显示环境下可能无效。
+    print("⚠️ 未自动通过，尝试物理点击（需真实可见窗口）...")
     for attempt in range(6):
         if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
@@ -259,7 +264,23 @@ def handle_turnstile(sb) -> bool:
 
         print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
 
-    print("  ❌ Turnstile 6 次均失败")
+    # 诊断信息: 输出 token 长度与页面状态，便于后续排查
+    print("  ❌ Turnstile 处理失败，输出诊断信息:")
+    try:
+        diag = sb.execute_script("""
+            (function(){
+                var i = document.querySelector('input[name="cf-turnstile-response"]');
+                return {
+                    has_input: !!i,
+                    token_len: i ? (i.value || '').length : -1,
+                    title: document.title
+                };
+            })()
+        """)
+        print(f"     Turnstile input 存在: {diag.get('has_input')}, token 长度: {diag.get('token_len')}, 标题: {diag.get('title')}")
+    except Exception as e:
+        print(f"     诊断获取异常: {e}")
+    sb.save_screenshot("turnstile_fail.png")
     return False
 
 
