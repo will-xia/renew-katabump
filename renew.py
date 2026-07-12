@@ -5,6 +5,7 @@ import os
 import time
 import subprocess
 import json
+import traceback
 import requests
 from seleniumbase import SB
 
@@ -338,7 +339,7 @@ def _find_turnstile_target(sb):
     best_box = None
     for iframe in sb.find_elements("iframe"):
         try:
-            box = iframe.rect
+            box = iframe.rect or {}
         except Exception:
             box = {}
         # 跳过 Cloudflare 隐藏的 1x1 token iframe，避免无谓的跨域切换
@@ -956,6 +957,7 @@ def main():
                 process_account(sb, user)
             except Exception as e:
                 print(f"⚠️ 账号处理异常: {e}")
+                traceback.print_exc()
                 send_tg_message("⚠️", "处理异常", str(e),
                                 email=user.get("username") or user.get("email") or "")
         print(f"[{idx}/{len(users)}] 账号处理完毕，关闭浏览器")
