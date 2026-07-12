@@ -316,47 +316,44 @@ def _cdp_click(sb, x, y):
 
 
 def _scroll_turnstile_into_view(sb):
+    """把页面上所有 iframe 滚入视口中心（不依赖 src 关键字）"""
     try:
-        for iframe in sb.find_elements("iframe"):
-            src = iframe.get_attribute("src") or ""
-            if "challenges.cloudflare.com" in src:
-                sb.execute_script("arguments[0].scrollIntoView({block:'center'})", iframe)
-                return
+        sb.execute_script(
+            "document.querySelectorAll('iframe').forEach(function(f){try{f.scrollIntoView({block:'center'});}catch(e){}});"
+        )
     except Exception:
         pass
 
 
-def _read_turnstile_data(sb):
-    """进入 Turnstile 跨域 iframe，读取其内部 checkbox 位置比例"""
-    try:
-        for iframe in sb.find_elements("iframe"):
-            src = iframe.get_attribute("src") or ""
-            if "challenges.cloudflare.com" in src:
-                sb.driver.switch_to.frame(iframe)
-                try:
-                    data = sb.execute_script("return window.__turnstile_data || null")
-                finally:
-                    sb.driver.switch_to.default_content()
-                if data and "xRatio" in data:
-                    return data
-    except Exception as e:
-        print(f"⚠️ 读取 Turnstile 内部数据异常: {e}")
+def _find_turnstile_target(sb):
+    """遍历所有 iframe，返回 (data, box)。
+
+    data 来自 Turnstile 跨域 iframe 内注入的 window.__turnstile_data
+    （Shadow DOM checkbox 的位置比例）。不按 src 关键字过滤，避免漏掉
+    srcdoc / about:blank / 动态域名 形态的 widget。
+    若没有任何 iframe 携带 data，则回退返回 (None, 第一个可见 iframe 的 box)。
+    """
+    best_box = None
+    for iframe in sb.find_elements("iframe"):
         try:
-            sb.driver.switch_to.default_content()
+            sb.driver.switch_to.frame(iframe)
+            try:
+                data = sb.execute_script("return window.__turnstile_data || null")
+            finally:
+                sb.driver.switch_to.default_content()
+            box = iframe.rect
+            if data and "xRatio" in data:
+                return data, box
+            if best_box is None and box.get("width", 0) > 0:
+                best_box = box
         except Exception:
-            pass
-    return None
-
-
-def _turnstile_iframe_box(sb):
-    try:
-        for iframe in sb.find_elements("iframe"):
-            src = iframe.get_attribute("src") or ""
-            if "challenges.cloudflare.com" in src:
-                return iframe.rect
-    except Exception:
-        pass
-    return None
+            try:
+                sb.driver.switch_to.default_content()
+            except Exception:
+                pass
+    if best_box is not None:
+        return None, best_box
+    return None, None
 
 
 def _altcha_checkbox_coords(sb):
@@ -412,8 +409,7 @@ def handle_turnstile(sb) -> bool:
         try: _scroll_turnstile_into_view(sb)
         except Exception: pass
 
-        data = _read_turnstile_data(sb)
-        box = _turnstile_iframe_box(sb)
+        data, box = _find_turnstile_target(sb)
         if data and box:
             clickX = box["x"] + box["width"] * data["xRatio"]
             clickY = box["y"] + box["height"] * data["yRatio"]
@@ -451,32 +447,40 @@ def handle_turnstile(sb) -> bool:
                     token_len: i ? (i.value || '').length : -1,
                     title: document.title
                 };
-                // 点击点实际命中的元素
-                var el = document.elementFromPoint(21, 142);
-                info.hit_tag = el ? el.tagName : null;
-                info.hit_class = el ? (el.className || '') : null;
-                info.hit_in_iframe = !!(el && el.tagName === 'IFRAME');
-                // Turnstile iframe 详情
+                // 列出所有 iframe 的 src 与位置
                 var iframes = document.querySelectorAll('iframe');
                 info.iframe_count = iframes.length;
+                info.iframes = [];
                 for (var k = 0; k < iframes.length; k++) {
                     var f = iframes[k];
                     var r = f.getBoundingClientRect();
-                    if (f.src && f.src.indexOf('challenges.cloudflare.com') >= 0) {
-                        info.ts_rect = {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)};
-                        info.ts_src = f.src.slice(0, 80);
-                    }
+                    var src = f.src || f.getAttribute('src') || '(empty)';
+                    info.iframes.push({
+                        src: src.slice(0, 90),
+                        x: Math.round(r.x), y: Math.round(r.y),
+                        w: Math.round(r.width), h: Math.round(r.height)
+                    });
                 }
-                // 页面可见的 verify / error 提示
-                var txt = (document.body.innerText || '').slice(0, 300);
-                info.page_text = txt;
+                // 每个 iframe 内是否设置了 __turnstile_data
+                info.ts_data = [];
                 return info;
             })()
         """)
         print(f"     Turnstile input 存在: {diag.get('has_input')}, token 长度: {diag.get('token_len')}, 标题: {diag.get('title')}")
-        print(f"     点击点(21,142)命中元素: tag={diag.get('hit_tag')}, class={diag.get('hit_class')}, 在iframe内={diag.get('hit_in_iframe')}")
-        print(f"     iframe 数量: {diag.get('iframe_count')}, Turnstile rect: {diag.get('ts_rect')}, src: {diag.get('ts_src')}")
-        print(f"     页面文本片段: {diag.get('page_text')}")
+        print(f"     iframe 数量: {diag.get('iframe_count')}")
+        for f in (diag.get('iframes') or []):
+            print(f"       iframe src={f['src']} rect=({f['x']},{f['y']},{f['w']}x{f['h']})")
+        # 跨域读取每个 iframe 内的 __turnstile_data
+        try:
+            for iframe in sb.find_elements("iframe"):
+                try:
+                    sb.driver.switch_to.frame(iframe)
+                    d = sb.execute_script("return window.__turnstile_data || null")
+                finally:
+                    sb.driver.switch_to.default_content()
+                print(f"       iframe __turnstile_data = {d}")
+        except Exception as e:
+            print(f"     读取 iframe 内 data 异常: {e}")
     except Exception as e:
         print(f"     诊断获取异常: {e}")
     sb.save_screenshot("turnstile_fail.png")
@@ -923,4 +927,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
