@@ -254,7 +254,132 @@ _TURNSTILE_COORDS_JS = """
 })()
 """
 
-#  人机验证处理（使用 SeleniumBase 内置 uc_gui_click_captcha）
+# 注入脚本: Hook Shadow DOM，捕获 Turnstile checkbox 在其 iframe 内的位置比例。
+# 参考成熟方案: 通过 CDP Input.dispatchMouseEvent 派发受信任鼠标事件，
+# 无需可见/聚焦窗口即可在 CI 中命中 Shadow DOM 内的 checkbox。
+_TURNSTILE_HOOK_JS = """
+(function() {
+    if (window.self === window.top) return;
+    try {
+        function getRandomInt(min, max){return Math.floor(Math.random()*(max-min+1))+min;}
+        var sx = getRandomInt(800,1200), sy = getRandomInt(400,600);
+        Object.defineProperty(MouseEvent.prototype,'screenX',{value:sx});
+        Object.defineProperty(MouseEvent.prototype,'screenY',{value:sy});
+    } catch(e){}
+    try {
+        var orig = Element.prototype.attachShadow;
+        Element.prototype.attachShadow = function(init){
+            var sr = orig.call(this, init);
+            if (sr) {
+                var report = function(){
+                    var cb = sr.querySelector('input[type="checkbox"]');
+                    if (cb) {
+                        var r = cb.getBoundingClientRect();
+                        if (r.width>0 && r.height>0 && window.innerWidth>0 && window.innerHeight>0) {
+                            window.__turnstile_data = {
+                                xRatio:(r.left + r.width/2)/window.innerWidth,
+                                yRatio:(r.top + r.height/2)/window.innerHeight
+                            };
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!report()) {
+                    var ob = new MutationObserver(function(){ if(report()) ob.disconnect(); });
+                    ob.observe(sr,{childList:true,subtree:true});
+                }
+            }
+            return sr;
+        };
+    } catch(e){}
+})()
+"""
+
+
+def _cdp_click(sb, x, y):
+    """通过 CDP 派发受信任鼠标事件（无需聚焦/可见窗口，headless CI 可用）"""
+    try:
+        sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": float(x), "y": float(y),
+            "button": "left", "clickCount": 1
+        })
+        time.sleep(0.05 + (time.time() % 1) * 0.08)
+        sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": float(x), "y": float(y),
+            "button": "left", "clickCount": 1
+        })
+        return True
+    except Exception as e:
+        print(f"⚠️ CDP 点击异常: {e}")
+        return False
+
+
+def _scroll_turnstile_into_view(sb):
+    try:
+        for iframe in sb.find_elements("iframe"):
+            src = iframe.get_attribute("src") or ""
+            if "challenges.cloudflare.com" in src:
+                sb.execute_script("arguments[0].scrollIntoView({block:'center'})", iframe)
+                return
+    except Exception:
+        pass
+
+
+def _read_turnstile_data(sb):
+    """进入 Turnstile 跨域 iframe，读取其内部 checkbox 位置比例"""
+    try:
+        for iframe in sb.find_elements("iframe"):
+            src = iframe.get_attribute("src") or ""
+            if "challenges.cloudflare.com" in src:
+                sb.driver.switch_to.frame(iframe)
+                try:
+                    data = sb.execute_script("return window.__turnstile_data || null")
+                finally:
+                    sb.driver.switch_to.default_content()
+                if data and "xRatio" in data:
+                    return data
+    except Exception as e:
+        print(f"⚠️ 读取 Turnstile 内部数据异常: {e}")
+        try:
+            sb.driver.switch_to.default_content()
+        except Exception:
+            pass
+    return None
+
+
+def _turnstile_iframe_box(sb):
+    try:
+        for iframe in sb.find_elements("iframe"):
+            src = iframe.get_attribute("src") or ""
+            if "challenges.cloudflare.com" in src:
+                return iframe.rect
+    except Exception:
+        pass
+    return None
+
+
+def _altcha_checkbox_coords(sb):
+    """读取 ALTCHA widget Shadow DOM 内 checkbox 的视口坐标"""
+    try:
+        return sb.execute_script("""
+            (function(){
+                var w = document.querySelector('altcha-widget');
+                if (!w) return null;
+                var root = w.shadowRoot;
+                var cb = root ? root.querySelector('input[type="checkbox"],[role="checkbox"]') : null;
+                if (!cb) return null;
+                cb.scrollIntoView({block:'center'});
+                var r = cb.getBoundingClientRect();
+                if (r.width>0 && r.height>0) return {x: r.x + r.width/2, y: r.y + r.height/2};
+                return null;
+            })()
+        """)
+    except Exception:
+        return None
+
+
+#  人机验证处理（CDP 受信任鼠标事件，精确点击 Shadow DOM 内 checkbox）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
 
@@ -273,43 +398,35 @@ def handle_turnstile(sb) -> bool:
             return True
         time.sleep(1)
 
-    # 阶段 2: 交互式挑战 —— 用真实鼠标点击 checkbox。
-    # 关键点: CI 里必须把 Chrome 窗口置顶/聚焦，否则 OS 级点击落空（uc_gui_click_captcha 自身不保证置顶）。
-    print("⚠️ 未自动通过，使用坐标真实点击 Turnstile checkbox...")
-    coords = None
-    try:
-        coords = sb.execute_script(_TURNSTILE_COORDS_JS)
-    except Exception:
-        pass
-
-    for attempt in range(8):
+    # 阶段 2: 交互式挑战 —— 通过 CDP 派发受信任鼠标事件，
+    # 精确点击 Shadow DOM 内的 checkbox（无需聚焦窗口，CI/headless 可用）。
+    print("⚠️ 未自动通过，使用 CDP 真实点击 Turnstile checkbox...")
+    for attempt in range(10):
         if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
             return True
 
-        # 重新展开并获取坐标（iframe 可能已重渲染）
+        # 重新展开并滚动到视口内（iframe 可能已重渲染）
         try: sb.execute_script(_EXPAND_JS)
         except Exception: pass
-        try:
-            coords = sb.execute_script(_TURNSTILE_COORDS_JS)
-        except Exception:
-            pass
+        try: _scroll_turnstile_into_view(sb)
+        except Exception: pass
 
-        if coords:
-            try:
-                wi = sb.execute_script(_WININFO_JS)
-            except Exception:
-                wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
-            bar = wi["oh"] - wi["ih"]
-            ax = coords["cx"] + wi["sx"]
-            ay = coords["cy"] + wi["sy"] + bar
-            print(f"🖱️ 聚焦窗口并点击 Turnstile ({ax}, {ay}) [尝试 {attempt + 1}]")
-            _xdotool_click(ax, ay)
+        data = _read_turnstile_data(sb)
+        box = _turnstile_iframe_box(sb)
+        if data and box:
+            clickX = box["x"] + box["width"] * data["xRatio"]
+            clickY = box["y"] + box["height"] * data["yRatio"]
+            print(f"🖱️ CDP 点击 Turnstile ({clickX:.1f},{clickY:.1f}) [尝试 {attempt + 1}]")
+            _cdp_click(sb, clickX, clickY)
+        elif box:
+            # 取不到内部比例时，回退为点击 iframe 中心
+            print(f"🖱️ CDP 点击 Turnstile iframe 中心 [尝试 {attempt + 1}]")
+            _cdp_click(sb, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         else:
-            # 取不到坐标时回退到 SeleniumBase 内置点击
-            print("⚠️ 未取得 Turnstile 坐标，回退 uc_gui_click_captcha [尝试 {0}]".format(attempt + 1))
+            # 完全取不到坐标时回退到 SeleniumBase 内置点击
+            print("⚠️ 未取得 Turnstile iframe，回退 uc_gui_click_captcha [尝试 {0}]".format(attempt + 1))
             try:
-                _activate_window()
                 sb.uc_gui_click_captcha()
             except Exception as e:
                 print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
@@ -596,8 +713,23 @@ def _solve_altcha(sb) -> bool:
             print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
             return True
 
-        # 策略 1: xdotool 物理点击 iframe 坐标
-        if coords:
+        # 策略 A: CDP 精确点击 Shadow DOM 内 checkbox（受信任事件，无需聚焦窗口）
+        cb = _altcha_checkbox_coords(sb)
+        if cb:
+            print(f"🖱️  CDP 点击 ALTCHA checkbox ({cb['x']:.1f},{cb['y']:.1f})")
+            _cdp_click(sb, cb["x"], cb["y"])
+            # 备份: 直接触发 shadow checkbox
+            sb.execute_script("""
+                (function(){
+                    var w = document.querySelector('altcha-widget');
+                    if (w && w.shadowRoot){
+                        var cb = w.shadowRoot.querySelector('input[type="checkbox"]');
+                        if (cb && !cb.checked) cb.click();
+                    }
+                })()
+            """)
+        # 策略 B: xdotool 物理点击 iframe 坐标
+        elif coords:
             try:
                 wi = sb.execute_script(_WININFO_JS)
             except Exception:
@@ -608,19 +740,7 @@ def _solve_altcha(sb) -> bool:
             print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
             _xdotool_click(ax, ay)
 
-        # 策略 2: SeleniumBase 原生点击模态框内 iframe 元素
-        try:
-            iframes = sb.find_elements('div.modal.show iframe')
-            for iframe in iframes:
-                try:
-                    iframe.click()
-                    print("🖱️  SeleniumBase 点击模态框 iframe")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 策略 3: JS 遍历模态框内所有可点击元素
+        # 策略 C: JS 遍历模态框内所有可点击元素
         sb.execute_script("""
             (function(){
                 var modal = document.querySelector('div.modal.show');
@@ -776,6 +896,17 @@ def main():
         print(f"{'=' * 25}")
         # 每个账号使用独立浏览器会话，避免登录态串号
         with SB(**sb_kwargs) as sb:
+            # 注入 Turnstile Shadow DOM 钩子（在每个新文档中生效，含跨域 iframe）
+            try:
+                sb.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _TURNSTILE_HOOK_JS})
+                print("✅ 已注入 Turnstile Shadow DOM 钩子")
+            except Exception as e:
+                print(f"⚠️ 注入 Turnstile 钩子失败: {e}")
+            # 固定视口，保证 CDP 点击坐标一致
+            try:
+                sb.set_window_size(1280, 720)
+            except Exception:
+                pass
             try:
                 sb.open("https://api.ip.sb/ip")
                 print(f"📍  当前出口IP: {sb.get_text('body')}")
@@ -792,3 +923,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
