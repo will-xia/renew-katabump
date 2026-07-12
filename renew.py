@@ -222,6 +222,38 @@ def _xdotool_click(x: int, y: int):
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
 
+# 定位 Turnstile iframe 并返回其中心坐标（视口坐标）
+_TURNSTILE_COORDS_JS = """
+(function() {
+    var iframes = document.querySelectorAll('iframe');
+    // 优先匹配 challenges.cloudflare.com 的 iframe
+    for (var i = 0; i < iframes.length; i++) {
+        var f = iframes[i];
+        var r = f.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+            var src = f.src || '';
+            var cls = f.className || '';
+            if (src.indexOf('challenges.cloudflare.com') >= 0 || cls.indexOf('cf-turnstile') >= 0) {
+                // 把 widget 滚入视口，确保点击命中
+                f.scrollIntoView({behavior: 'auto', block: 'center'});
+                var r2 = f.getBoundingClientRect();
+                return { cx: Math.round(r2.x + r2.width / 2), cy: Math.round(r2.y + r2.height / 2) };
+            }
+        }
+    }
+    // 回退: 任意可见 iframe（取最后一个）
+    for (var j = iframes.length - 1; j >= 0; j--) {
+        var rr = iframes[j].getBoundingClientRect();
+        if (rr.width > 0 && rr.height > 0) {
+            iframes[j].scrollIntoView({behavior: 'auto', block: 'center'});
+            var rr2 = iframes[j].getBoundingClientRect();
+            return { cx: Math.round(rr2.x + rr2.width / 2), cy: Math.round(rr2.y + rr2.height / 2) };
+        }
+    }
+    return null;
+})()
+"""
+
 #  人机验证处理（使用 SeleniumBase 内置 uc_gui_click_captcha）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
@@ -241,19 +273,46 @@ def handle_turnstile(sb) -> bool:
             return True
         time.sleep(1)
 
-    # 阶段 2: 若未自动通过（交互式挑战），再尝试物理点击。
-    # 注意: uc_gui_click_captcha 依赖真实可见窗口与鼠标，无显示环境下可能无效。
-    print("⚠️ 未自动通过，尝试物理点击（需真实可见窗口）...")
-    for attempt in range(6):
+    # 阶段 2: 交互式挑战 —— 用真实鼠标点击 checkbox。
+    # 关键点: CI 里必须把 Chrome 窗口置顶/聚焦，否则 OS 级点击落空（uc_gui_click_captcha 自身不保证置顶）。
+    print("⚠️ 未自动通过，使用坐标真实点击 Turnstile checkbox...")
+    coords = None
+    try:
+        coords = sb.execute_script(_TURNSTILE_COORDS_JS)
+    except Exception:
+        pass
+
+    for attempt in range(8):
         if sb.execute_script(_SOLVED_JS):
             print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
             return True
 
-        print(f"🖱️ 第 {attempt + 1} 次调用 uc_gui_click_captcha...")
+        # 重新展开并获取坐标（iframe 可能已重渲染）
+        try: sb.execute_script(_EXPAND_JS)
+        except Exception: pass
         try:
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
+            coords = sb.execute_script(_TURNSTILE_COORDS_JS)
+        except Exception:
+            pass
+
+        if coords:
+            try:
+                wi = sb.execute_script(_WININFO_JS)
+            except Exception:
+                wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
+            bar = wi["oh"] - wi["ih"]
+            ax = coords["cx"] + wi["sx"]
+            ay = coords["cy"] + wi["sy"] + bar
+            print(f"🖱️ 聚焦窗口并点击 Turnstile ({ax}, {ay}) [尝试 {attempt + 1}]")
+            _xdotool_click(ax, ay)
+        else:
+            # 取不到坐标时回退到 SeleniumBase 内置点击
+            print("⚠️ 未取得 Turnstile 坐标，回退 uc_gui_click_captcha [尝试 {0}]".format(attempt + 1))
+            try:
+                _activate_window()
+                sb.uc_gui_click_captcha()
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
 
         # 等待验证结果（最多 8 秒）
         for _ in range(16):
