@@ -68,7 +68,7 @@ mixed-port: {MIHOMO_MIXED_PORT}
 allow-lan: false
 mode: rule
 log-level: debug
-external-controller: {MIHOMO_CONTROLLER}
+external-controller: 127.0.0.1:9090
 proxy-providers:
   sub1:
     type: http
