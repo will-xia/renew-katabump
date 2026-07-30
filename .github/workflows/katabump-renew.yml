@@ -60,7 +60,10 @@ jobs:
           pip install seleniumbase requests pyyaml
 
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        # -b: 缓冲测试内部的 stdout，只在失败时打印。
+        # 否则 mock 出来的假日志（比如「❌ Turnstile 处理失败」）会混进
+        # CI 日志，跟真实运行的输出难以区分。
+        run: python -m unittest discover -s tests -v -b
 
       - name: Prepare output directories
         run: |
