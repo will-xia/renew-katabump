@@ -550,6 +550,47 @@ class TestLoadMihomoNodes(unittest.TestCase):
         self.assertTrue(any("失败" in m for m in logs))
 
 
+class TestHealthCheck(unittest.TestCase):
+    """并发测速: 顺序、失败原因汇总"""
+
+    def _run(self, outcomes):
+        """outcomes: {节点名: (是否健康, 原因)}"""
+        logs = []
+        patch_renew(self, _mihomo_log=logs.append,
+                    _node_delay=lambda n: outcomes[n])
+        names = list(outcomes)
+        return renew.test_mihomo_proxies(names, workers=4), logs
+
+    def test_keeps_input_order(self):
+        # 并发返回顺序不确定，结果必须按入参顺序对齐，不能错位
+        outcomes = {f"n{i}": (i % 2 == 0, None if i % 2 == 0 else "timeout")
+                    for i in range(10)}
+        healthy, _ = self._run(outcomes)
+        self.assertEqual(healthy, ["n0", "n2", "n4", "n6", "n8"])
+
+    def test_summarizes_reasons_when_all_fail(self):
+        outcomes = {"a": (False, "ReadTimeout: x"),
+                    "b": (False, "ReadTimeout: x"),
+                    "c": (False, "HTTP 400 boom")}
+        healthy, logs = self._run(outcomes)
+        self.assertEqual(healthy, [])
+        joined = "\n".join(logs)
+        self.assertIn("无一节点测通", joined)
+        self.assertIn("2 次: ReadTimeout: x", joined)
+        self.assertIn("1 次: HTTP 400 boom", joined)
+
+    def test_no_reason_dump_when_some_healthy(self):
+        outcomes = {"a": (True, None), "b": (False, "timeout")}
+        healthy, logs = self._run(outcomes)
+        self.assertEqual(healthy, ["a"])
+        self.assertNotIn("无一节点测通", "\n".join(logs))
+
+    def test_empty_input(self):
+        healthy, logs = self._run({})
+        self.assertEqual(healthy, [])
+        self.assertNotIn("无一节点测通", "\n".join(logs))
+
+
 class TestVersionConstants(unittest.TestCase):
     """版本号/provider 名只能有一个来源"""
 
