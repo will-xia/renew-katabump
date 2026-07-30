@@ -565,9 +565,14 @@ def _cdp_click(sb, x, y):
     """
     _ensure_connected(sb)
     try:
-        sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": float(x), "y": float(y)
-        })
+        # 分几步移到目标，纯跳变的指针轨迹更容易被判为脚本操作
+        for step in (0.45, 0.75, 0.92, 1.0):
+            sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseMoved",
+                "x": max(0.0, float(x) - 60 * (1 - step)),
+                "y": max(0.0, float(y) - 35 * (1 - step)),
+            })
+            time.sleep(0.05)
         time.sleep(0.12)
         sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
             "type": "mousePressed", "x": float(x), "y": float(y),
@@ -726,7 +731,15 @@ def handle_turnstile(sb) -> bool:
                 print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试，token 长度 {token_len}）")
                 return True
 
-        print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
+        # 挑战一旦判失败/过期，同一个 widget 再点也不会通过，
+        # 必须调 turnstile.reset() 让 Cloudflare 重新下发一次挑战。
+        print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
+        try:
+            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                    " catch(e) { return 'reset failed: ' + e.message; } })()")
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ turnstile.reset() 调用异常: {e}")
 
     _turnstile_diagnostics(sb, "turnstile_fail")
     return False
@@ -1193,7 +1206,71 @@ def main():
     stats = {"processed": 0, "success": 0, "skipped": 0}
     total = len(users)
 
+    def run_account(idx, user, email):
+        """跑单个账号（含换节点重试），返回 "ok" / "skip"；失败抛 RenewError"""
+        nonlocal proxy_index
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                print(f"\n  [重试 {attempt + 1}/{max_retries}]")
+
+            # 切换代理节点
+            if use_mihomo and proxy_pool:
+                node_name = proxy_pool[proxy_index % len(proxy_pool)]
+                proxy_index += 1
+                switch_mihomo_proxy(node_name)
+                time.sleep(1)
+
+            # 构建浏览器参数
+            sb_kwargs = {"uc": True, "headless": False}
+            if use_mihomo:
+                sb_kwargs["proxy"] = f"http://127.0.0.1:{MIHOMO_MIXED_PORT}"
+            elif is_proxy:
+                sb_kwargs["proxy"] = proxy_str
+
+            # 出口 IP 用 requests 走同一个代理查，不要用浏览器:
+            # UC 模式下 sb.open() 会把驱动切进 CDP 模式并断开连接，
+            # 之后 execute_script 的语义、execute_cdp_cmd 的可用性全变，
+            # 白白给后面的验证码环节埋坑。
+            print(f"  📍 出口IP: {_check_exit_ip(sb_kwargs.get('proxy'))}")
+
+            with SB(**sb_kwargs) as sb:
+                # 不注入任何 prototype 钩子: 改写 Element.prototype.attachShadow /
+                # MouseEvent.prototype.screenX 会让 toString() 不再是 [native code]，
+                # 属于 Cloudflare 一眼就能识别的篡改特征，而且对定位 widget 毫无帮助
+                # （widget 的 checkbox 在跨域 iframe 内部，不在顶层 shadow root 里）。
+                # 窗口略高一些，保证 Turnstile widget 落在视口内（CDP 点击用视口坐标）
+                try:
+                    sb.set_window_size(1280, 900)
+                except Exception:
+                    pass
+
+                # 只有「登录失败」才换节点重试；其它异常留档后直接上抛，
+                # 由 main 记为该账号失败，继续处理下一个账号。
+                try:
+                    login_ok, status = process_account(sb, user)
+                except RenewError:
+                    raise
+                except Exception as e:
+                    print("  ❌ 执行过程中出现未预期异常:")
+                    traceback.print_exc()
+                    try:
+                        _save_artifacts(sb, f"exception_{idx}")
+                    except Exception:
+                        pass
+                    raise RenewError(f"未预期异常: {e}")
+
+                if login_ok:
+                    return status
+                if attempt == max_retries - 1:
+                    send_tg_message("❌", "登录失败", f"{max_retries} 次尝试均未成功",
+                                    email=email)
+                    raise RenewError(f"{max_retries} 次尝试后仍然登录失败")
+
+    failures = []
     try:
+        # 所有账号都要跑完，单个账号失败只记录，不影响后面的账号；
+        # 最终按整体失败情况决定退出码。
         for idx, user in enumerate(users, start=1):
             email = user.get("username") or user.get("email") or ""
             print(f"\n{'=' * 25}")
@@ -1201,66 +1278,12 @@ def main():
             print(f"{'=' * 25}")
 
             stats["processed"] += 1
-            status = None
-
-            for attempt in range(max_retries):
-                if attempt > 0:
-                    print(f"\n  [重试 {attempt + 1}/{max_retries}]")
-
-                # 切换代理节点
-                if use_mihomo and proxy_pool:
-                    node_name = proxy_pool[proxy_index % len(proxy_pool)]
-                    proxy_index += 1
-                    switch_mihomo_proxy(node_name)
-                    time.sleep(1)
-
-                # 构建浏览器参数
-                sb_kwargs = {"uc": True, "headless": False}
-                if use_mihomo:
-                    sb_kwargs["proxy"] = f"http://127.0.0.1:{MIHOMO_MIXED_PORT}"
-                elif is_proxy:
-                    sb_kwargs["proxy"] = proxy_str
-
-                # 出口 IP 用 requests 走同一个代理查，不要用浏览器:
-                # UC 模式下 sb.open() 会把驱动切进 CDP 模式并断开连接，
-                # 之后 execute_script 的语义、execute_cdp_cmd 的可用性全变，
-                # 白白给后面的验证码环节埋坑。
-                print(f"  📍 出口IP: {_check_exit_ip(sb_kwargs.get('proxy'))}")
-
-                with SB(**sb_kwargs) as sb:
-                    # 不注入任何 prototype 钩子: 改写 Element.prototype.attachShadow /
-                    # MouseEvent.prototype.screenX 会让 toString() 不再是 [native code]，
-                    # 属于 Cloudflare 一眼就能识别的篡改特征，而且对定位 widget 毫无帮助
-                    # （widget 的 checkbox 在跨域 iframe 内部，不在顶层 shadow root 里）。
-                    # 窗口略高一些，保证 Turnstile widget 落在视口内（CDP 点击用视口坐标）
-                    try:
-                        sb.set_window_size(1280, 900)
-                    except Exception:
-                        pass
-
-                    # 执行登录 + 续期。
-                    # 只有「登录失败」才重试（可能是节点问题）；
-                    # 其它任何异常都属于真错误，留档后立即向上抛，中断整个流程。
-                    try:
-                        login_ok, status = process_account(sb, user)
-                    except RenewError:
-                        raise
-                    except Exception:
-                        print("  ❌ 执行过程中出现未预期异常:")
-                        traceback.print_exc()
-                        try:
-                            _save_artifacts(sb, f"exception_{idx}")
-                        except Exception:
-                            pass
-                        raise
-
-                    if login_ok:
-                        break  # 登录成功，不再重试
-                    if attempt == max_retries - 1:
-                        send_tg_message("❌", "登录失败", f"{max_retries} 次尝试均未成功",
-                                        email=email)
-                        raise RenewError(
-                            f"账号 {email} 在 {max_retries} 次尝试后仍然登录失败")
+            try:
+                status = run_account(idx, user, email)
+            except RenewError as e:
+                print(f"  ❌ {email} 处理失败: {e}")
+                failures.append(f"{email}: {e}")
+                continue
 
             if status == "skip":
                 stats["skipped"] += 1
@@ -1278,6 +1301,11 @@ def main():
         print(f"{'=' * 40}")
         if use_mihomo:
             stop_mihomo()
+
+    # 全部账号跑完后，按最终失败情况决定是否中断（非零退出）
+    if failures:
+        raise RenewError(
+            f"{len(failures)}/{total} 个账号失败:\n  - " + "\n  - ".join(failures))
 
 
 if __name__ == "__main__":
