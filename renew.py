@@ -677,7 +677,7 @@ def _turnstile_diagnostics(sb, tag: str):
     _save_artifacts(sb, tag)
 
 
-#  人机验证处理（CDP 受信任鼠标事件，点击 closed shadow root 内的 checkbox）
+#  人机验证处理（使用 SeleniumBase UC Mode 内置方法，比手动 CDP 点击更可靠）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
     _ensure_connected(sb)
@@ -696,15 +696,78 @@ def handle_turnstile(sb) -> bool:
 
     # 阶段 1: managed / 隐形模式可能自动放行，先短暂等待，避免多余点击
     print("⏳ 等待 Turnstile 自动通过...")
-    for i in range(8):
+    for i in range(12):
         if _js(sb, _SOLVED_JS):
             print(f"✅ Turnstile 已自动通过（{i+1}s）")
             return True
         time.sleep(1)
 
-    # 阶段 2: 点击 checkbox。checkbox 位于容器左侧、垂直居中，
-    # 实测偏移约 21px；不同 data-size 略有差异，逐次尝试几个偏移值。
-    print("⚠️ 未自动通过，CDP 点击 Turnstile checkbox...")
+    # 阶段 2: 使用 SeleniumBase UC Mode 内置方法点击 checkbox
+    # Turnstile widget 的 checkbox 在 closed shadow root iframe 内，
+    # 手动 CDP 点击无法穿透，必须用 UC Mode 的 PyAutoGUI 模拟真实鼠标点击
+    print("⚠️ 未自动通过，使用 UC Mode 内置方法点击 Turnstile checkbox...")
+
+    # 策略 A: uc_gui_click_captcha() - 使用 PyAutoGUI 模拟真实鼠标点击
+    for attempt in range(3):
+        if _js(sb, _SOLVED_JS):
+            print("✅ Turnstile 已通过")
+            return True
+
+        try:
+            print(f"🖱️  尝试 uc_gui_click_captcha() [尝试 {attempt + 1}]")
+            sb.uc_gui_click_captcha()
+            time.sleep(2)
+
+            # 等待验证结果（最多 10 秒）
+            for _ in range(20):
+                time.sleep(0.5)
+                if _js(sb, _SOLVED_JS):
+                    token_len = _js(sb, _TOKEN_LEN_JS)
+                    print(f"✅ Turnstile 通过（uc_gui_click_captcha，token 长度 {token_len}）")
+                    return True
+        except Exception as e:
+            print(f"⚠️ uc_gui_click_captcha() 异常: {e}")
+
+        # reset widget 后重试
+        print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
+        try:
+            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                    " catch(e) { return 'reset failed: ' + e.message; } })()")
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ turnstile.reset() 调用异常: {e}")
+
+    # 策略 B: solve_captcha() - 另一个内置方法
+    for attempt in range(2):
+        if _js(sb, _SOLVED_JS):
+            print("✅ Turnstile 已通过")
+            return True
+
+        try:
+            print(f"🖱️  尝试 solve_captcha() [尝试 {attempt + 1}]")
+            sb.solve_captcha()
+            time.sleep(2)
+
+            # 等待验证结果
+            for _ in range(20):
+                time.sleep(0.5)
+                if _js(sb, _SOLVED_JS):
+                    token_len = _js(sb, _TOKEN_LEN_JS)
+                    print(f"✅ Turnstile 通过（solve_captcha，token 长度 {token_len}）")
+                    return True
+        except Exception as e:
+            print(f"⚠️ solve_captcha() 异常: {e}")
+
+        # reset widget
+        try:
+            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                    " catch(e) { return 'reset failed: ' + e.message; } })()")
+            time.sleep(2)
+        except Exception:
+            pass
+
+    # 策略 C: 回退到手动 CDP 点击（最后手段）
+    print("⚠️ 内置方法均失败，回退到手动 CDP 点击...")
     x_offsets = (24, 30, 18, 36)
     for attempt in range(4):
         if _js(sb, _SOLVED_JS):
@@ -723,17 +786,15 @@ def handle_turnstile(sb) -> bool:
         print(f"🖱️ CDP 点击 ({cx:.0f},{cy:.0f}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
         _cdp_click(sb, cx, cy)
 
-        # 等待验证结果（最多 12 秒；实测通过时约 1.5 秒）
+        # 等待验证结果
         for _ in range(24):
             time.sleep(0.5)
             if _js(sb, _SOLVED_JS):
                 token_len = _js(sb, _TOKEN_LEN_JS)
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试，token 长度 {token_len}）")
+                print(f"✅ Turnstile 通过（CDP 点击，token 长度 {token_len}）")
                 return True
 
-        # 挑战一旦判失败/过期，同一个 widget 再点也不会通过，
-        # 必须调 turnstile.reset() 让 Cloudflare 重新下发一次挑战。
-        print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
+        # reset widget
         try:
             _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
                     " catch(e) { return 'reset failed: ' + e.message; } })()")
@@ -749,12 +810,12 @@ def handle_turnstile(sb) -> bool:
 def login(sb, email: str, password: str) -> bool:
     print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
     sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
-    time.sleep(6)
+    time.sleep(8)
 
-    # 先等待 Cloudflare 验证通过（最多等 30 秒）
+    # 先等待 Cloudflare 验证通过（最多等 45 秒）
     print("⏳ 等待 Cloudflare 验证通过...")
     cf_passed = False
-    for i in range(30):
+    for i in range(45):
         page_src = sb.get_page_source() or ""
         if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
             cf_passed = True
@@ -797,10 +858,10 @@ def login(sb, email: str, password: str) -> bool:
     js_fill_input(sb, 'input[name="password"]', password)
     time.sleep(1)
 
-    # 等待 Turnstile 验证框出现（最多 10 秒）
+    # 等待 Turnstile 验证框出现（最多 15 秒）
     print("⏳ 等待 Turnstile 验证框出现...")
     ts_found = False
-    for i in range(10):
+    for i in range(15):
         if _js(sb, _EXISTS_JS):
             ts_found = True
             print(f"✅ 检测到 Turnstile（{i+1}s）")
