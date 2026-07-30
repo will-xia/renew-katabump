@@ -346,6 +346,18 @@ def fetch_subscription(sub_url: str) -> list:
         # 错误响应通常是短 JSON/文本提示，不含节点凭据
         raise RuntimeError(f"订阅返回 {r.status_code}: {r.text[:200].strip()!r}")
 
+    # HTML 单独判一下: 直接丢给 yaml.safe_load 会报一句像
+    # "mapping values are not allowed here: --tab-size-preference: 4"
+    # 这样指着 CSS 的错，完全看不出真正发生了什么。
+    ctype = (r.headers.get("content-type") or "").lower()
+    head = r.content[:512].lstrip().lower()
+    if "html" in ctype or head.startswith(b"<!doctype html") or head.startswith(b"<html"):
+        raise RuntimeError(
+            f"订阅返回的是 HTML 页面而不是 Clash 配置"
+            f"（{len(r.content)} 字节, content-type={ctype}）。"
+            "常见原因: 短时间内拉取太频繁被限流、订阅需要人机验证、"
+            "或链接已失效被跳到了网页版。")
+
     data = yaml.safe_load(r.content)
     if not isinstance(data, dict) or not isinstance(data.get("proxies"), list):
         raise ValueError("订阅不是 Clash/mihomo YAML 格式（找不到 proxies 列表），"

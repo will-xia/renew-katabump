@@ -642,6 +642,63 @@ class TestHealthCheck(unittest.TestCase):
         self.assertEqual(captured, {}, "没有节点时不该发请求")
 
 
+class TestFetchSubscription(unittest.TestCase):
+    """订阅下载: 各种「不是 Clash 配置」的情况要给出能看懂的报错"""
+
+    def _fetch(self, status=200, body=b"", headers=None):
+        resp = types.SimpleNamespace(
+            status_code=status, content=body,
+            text=body.decode("utf-8", "replace"),
+            headers=headers or {})
+        logs = []
+        patch_renew(self, _mihomo_log=logs.append,
+                    requests=types.SimpleNamespace(get=lambda *a, **k: resp))
+        return renew.fetch_subscription("https://sub.example.com/x"), logs
+
+    def test_parses_clash_yaml(self):
+        body = b"proxies:\n  - name: HK01\n    type: ss\n"
+        proxies, logs = self._fetch(body=body, headers={"content-type": "text/plain"})
+        self.assertEqual(proxies, [{"name": "HK01", "type": "ss"}])
+        self.assertTrue(any("2 个节点" in m or "1 个节点" in m for m in logs))
+
+    def test_rejects_html_with_actionable_message(self):
+        # 实际遇到过: 被限流后返回 308KB 的网页，直接 yaml 解析会报
+        # "mapping values are not allowed here: --tab-size-preference: 4"
+        body = b"<!DOCTYPE html>\n<html><style>:root{--tab-size-preference: 4;}</style>"
+        with self.assertRaises(RuntimeError) as cm:
+            self._fetch(body=body, headers={"content-type": "text/html; charset=utf-8"})
+        msg = str(cm.exception)
+        self.assertIn("HTML", msg)
+        self.assertIn("限流", msg)
+
+    def test_detects_html_even_without_content_type(self):
+        with self.assertRaises(RuntimeError) as cm:
+            self._fetch(body=b"  <html><body>nope</body></html>", headers={})
+        self.assertIn("HTML", str(cm.exception))
+
+    def test_reports_http_error_status(self):
+        with self.assertRaises(RuntimeError) as cm:
+            self._fetch(status=503, body=b'{"error":"expired"}')
+        self.assertIn("503", str(cm.exception))
+
+    def test_rejects_base64_v2ray_subscription(self):
+        with self.assertRaises(ValueError) as cm:
+            self._fetch(body=b"dm1lc3M6Ly9leUp2Iiwi", headers={"content-type": "text/plain"})
+        self.assertIn("proxies", str(cm.exception))
+
+    def test_logs_subscription_userinfo(self):
+        _, logs = self._fetch(
+            body=b"proxies: []\n",
+            headers={"content-type": "text/plain",
+                     "subscription-userinfo": "upload=0; download=1; total=2; expire=3"})
+        self.assertTrue(any("subscription-userinfo" in m for m in logs))
+
+    def test_empty_proxies_list_is_valid_but_empty(self):
+        proxies, _ = self._fetch(body=b"proxies: []\n",
+                                 headers={"content-type": "text/plain"})
+        self.assertEqual(proxies, [])
+
+
 class TestPickNode(unittest.TestCase):
     """节点挑选: 优先复用已验证能过 Turnstile 的出口"""
 
