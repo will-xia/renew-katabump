@@ -2,12 +2,20 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import time
 import subprocess
 import json
 import traceback
 import requests
 from seleniumbase import SB
+
+
+class RenewError(Exception):
+    """致命错误: 立即中断整个流程，并以非零退出码结束（CI 会标红）。
+
+    「未到续期时间」不属于错误，走 skip 状态，不抛这个异常。
+    """
 
 # ==========================================
 # ========== Mihomo 代理池模块 ==============
@@ -304,33 +312,12 @@ def send_tg_message(status_icon, status_text, time_left="", email=EMAIL):
         print(f"⚠️ Telegram 通知发送异常: {e}")
 
 #  页面注入脚本
-_EXPAND_JS = """
-(function() {
-    var ts = document.querySelector('input[name="cf-turnstile-response"]');
-    if (!ts) return 'no-turnstile';
-    var el = ts;
-    for (var i = 0; i < 20; i++) {
-        el = el.parentElement;
-        if (!el) break;
-        var s = window.getComputedStyle(el);
-        if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden')
-            el.style.overflow = 'visible';
-        el.style.minWidth = 'max-content';
-    }
-    document.querySelectorAll('iframe').forEach(function(f){
-        if (f.src && f.src.includes('challenges.cloudflare.com')) {
-            f.style.width = '300px'; f.style.height = '65px';
-            f.style.minWidth = '300px';
-            f.style.visibility = 'visible'; f.style.opacity = '1';
-        }
-    });
-    return 'done';
-})()
-"""
-
+# 下面这些常量统一写成「表达式」形式，取值必须走 _js()，不要直接
+# sb.execute_script()。原因见 _js() 的注释: 两条通道的语义正好相反。
 _EXISTS_JS = """
 (function(){
-    return document.querySelector('input[name="cf-turnstile-response"]') !== null;
+    return document.querySelector('.cf-turnstile') !== null
+        || document.querySelector('input[name="cf-turnstile-response"]') !== null;
 })()
 """
 
@@ -338,6 +325,13 @@ _SOLVED_JS = """
 (function(){
     var i = document.querySelector('input[name="cf-turnstile-response"]');
     return !!(i && i.value && i.value.length > 20);
+})()
+"""
+
+_TOKEN_LEN_JS = """
+(function(){
+    var i = document.querySelector('input[name="cf-turnstile-response"]');
+    return i ? (i.value || '').length : -1;
 })()
 """
 
@@ -405,6 +399,61 @@ _ALTCHA_SOLVED_JS = """
 })()
 """
 
+#  底层 JS 取值工具
+def _js(sb, expression):
+    """执行 JS 表达式并取回返回值。
+
+    必须用这个包装，不要直接 sb.execute_script() 取值 —— UC 模式下
+    sb.execute_script 会在两条语义**完全相反**的通道之间自动切换:
+
+      * 驱动已连接 → selenium driver.execute_script: 脚本当「函数体」跑，
+        少了 return 就静默返回 None（判断永远为假，最难查的一类 bug）；
+      * 驱动断连 → sb.cdp.evaluate: 脚本当「表达式」求值，
+        带 return 会直接抛 SyntaxError: Illegal return statement。
+
+    连接状态在一次运行里会来回变化，所以这里先按函数体形式发，
+    命中 CDP 通道报语法错时再按表达式形式重发。语法错发生在解析阶段，
+    不会造成重复执行。
+
+    注意 strip(): 表达式常量都以换行开头，`return` 后面直接跟换行会被
+    JS 的自动分号插入(ASI)截断成 `return;`，结果又变成静默的 None。
+    """
+    expression = expression.strip()
+    try:
+        return sb.execute_script("return " + expression)
+    except Exception as first_err:
+        try:
+            return sb.execute_script(expression)
+        except Exception:
+            raise first_err
+
+
+def _check_exit_ip(proxy: str = None) -> str:
+    """查询出口 IP（不经过浏览器，避免打乱驱动连接状态）"""
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        r = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        return (r.text or "").strip() or "(空响应)"
+    except Exception as e:
+        return f"(查询失败: {e})"
+
+
+def _ensure_connected(sb):
+    """UC 模式断连时恢复连接。
+
+    断连状态下 driver.execute_cdp_cmd 无法下发（点击验证码要用它），
+    所以点击前必须确认连接是活着的。
+    """
+    try:
+        if hasattr(sb.driver, "is_connected") and not sb.driver.is_connected():
+            print("🔌 驱动处于断连状态，重新连接...")
+            sb.driver.connect()
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"⚠️ 重新连接驱动失败: {e}")
+
+
 #  底层输入工具
 def js_fill_input(sb, selector: str, text: str):
     safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
@@ -450,86 +499,76 @@ def _xdotool_click(x: int, y: int):
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
 
-# 定位 Turnstile iframe 并返回其中心坐标（视口坐标）
-_TURNSTILE_COORDS_JS = """
+# 定位 Turnstile widget 并返回其视口坐标。
+#
+# 关键事实(已实测): Turnstile 把 widget 的 iframe 渲染在 **closed shadow root** 里，
+# 所以 document.querySelectorAll('iframe') 只能看到 Cloudflare 那个 1x1 的
+# jsd 探测 iframe，永远找不到 widget；element.shadowRoot 对 closed 模式返回 null，
+# switch_to.frame() 也进不去。
+# 但宿主容器 <div class="cf-turnstile"> 本身在普通 DOM 里，位置/尺寸完全可读，
+# checkbox 固定在容器左侧（实测偏移约 21px，垂直居中），据此即可精确点击。
+_TS_BOX_JS = """
 (function() {
-    var iframes = document.querySelectorAll('iframe');
-    // 优先匹配 challenges.cloudflare.com 的 iframe
-    for (var i = 0; i < iframes.length; i++) {
-        var f = iframes[i];
-        var r = f.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-            var src = f.src || '';
-            var cls = f.className || '';
-            if (src.indexOf('challenges.cloudflare.com') >= 0 || cls.indexOf('cf-turnstile') >= 0) {
-                // 把 widget 滚入视口，确保点击命中
-                f.scrollIntoView({behavior: 'auto', block: 'center'});
-                var r2 = f.getBoundingClientRect();
-                return { cx: Math.round(r2.x + r2.width / 2), cy: Math.round(r2.y + r2.height / 2) };
-            }
-        }
-    }
-    // 回退: 任意可见 iframe（取最后一个）
-    for (var j = iframes.length - 1; j >= 0; j--) {
-        var rr = iframes[j].getBoundingClientRect();
-        if (rr.width > 0 && rr.height > 0) {
-            iframes[j].scrollIntoView({behavior: 'auto', block: 'center'});
-            var rr2 = iframes[j].getBoundingClientRect();
-            return { cx: Math.round(rr2.x + rr2.width / 2), cy: Math.round(rr2.y + rr2.height / 2) };
-        }
-    }
-    return null;
+    var c = document.querySelector('.cf-turnstile');
+    if (!c) return null;
+    c.scrollIntoView({block: 'center'});
+    var r = c.getBoundingClientRect();
+    if (r.width < 30 || r.height < 20) return null;
+    return {x: r.x, y: r.y, w: r.width, h: r.height,
+            vw: window.innerWidth, vh: window.innerHeight};
 })()
 """
 
-# 注入脚本: Hook Shadow DOM，捕获 Turnstile checkbox 在其 iframe 内的位置比例。
-# 参考成熟方案: 通过 CDP Input.dispatchMouseEvent 派发受信任鼠标事件，
-# 无需可见/聚焦窗口即可在 CI 中命中 Shadow DOM 内的 checkbox。
-_TURNSTILE_HOOK_JS = """
-(function() {
-    // 注意: 不要跳过顶层框架。部分站点把 Turnstile checkbox 渲染在
-    // 主文档自身的 Shadow DOM（<div class="cf-turnstile"> 内），而非跨域 iframe，
-    // 因此顶层框架也必须 hook attachShadow 才能捕获位置。
+# 失败时的诊断信息（不要 switch_to.frame，那会在 UC 模式下打断驱动连接）
+_TS_DIAG_JS = r"""
+(function(){
+    var c = document.querySelector('.cf-turnstile');
+    var i = document.querySelector('input[name="cf-turnstile-response"]');
+    var out = {
+        title: document.title,
+        url: location.href,
+        has_container: !!c,
+        container_rect: null,
+        container_html: c ? c.outerHTML.slice(0, 300) : null,
+        has_input: !!i,
+        token_len: i ? (i.value || '').length : -1,
+        turnstile_api: typeof window.turnstile,
+        light_dom_iframes: [],
+        cf_resources: []
+    };
+    if (c) {
+        var r = c.getBoundingClientRect();
+        out.container_rect = {x: Math.round(r.x), y: Math.round(r.y),
+                              w: Math.round(r.width), h: Math.round(r.height)};
+    }
+    document.querySelectorAll('iframe').forEach(function(f){
+        var fr = f.getBoundingClientRect();
+        out.light_dom_iframes.push(
+            (f.src || '(empty)').slice(0, 80) + ' ' +
+            Math.round(fr.width) + 'x' + Math.round(fr.height));
+    });
     try {
-        function getRandomInt(min, max){return Math.floor(Math.random()*(max-min+1))+min;}
-        var sx = getRandomInt(800,1200), sy = getRandomInt(400,600);
-        Object.defineProperty(MouseEvent.prototype,'screenX',{value:sx});
-        Object.defineProperty(MouseEvent.prototype,'screenY',{value:sy});
-    } catch(e){}
-    try {
-        var orig = Element.prototype.attachShadow;
-        Element.prototype.attachShadow = function(init){
-            var sr = orig.call(this, init);
-            if (sr) {
-                var report = function(){
-                    var cb = sr.querySelector('input[type="checkbox"]');
-                    if (cb) {
-                        var r = cb.getBoundingClientRect();
-                        if (r.width>0 && r.height>0 && window.innerWidth>0 && window.innerHeight>0) {
-                            window.__turnstile_data = {
-                                xRatio:(r.left + r.width/2)/window.innerWidth,
-                                yRatio:(r.top + r.height/2)/window.innerHeight
-                            };
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-                if (!report()) {
-                    var ob = new MutationObserver(function(){ if(report()) ob.disconnect(); });
-                    ob.observe(sr,{childList:true,subtree:true});
-                }
-            }
-            return sr;
-        };
-    } catch(e){}
+        out.cf_resources = performance.getEntriesByType('resource')
+            .filter(function(e){ return /challenge-platform|turnstile/.test(e.name); })
+            .map(function(e){ return e.name.replace(/^https:\/\/[^\/]+/, '').slice(0, 100); });
+    } catch (e) {}
+    return out;
 })()
 """
 
 
 def _cdp_click(sb, x, y):
-    """通过 CDP 派发受信任鼠标事件（无需聚焦/可见窗口，headless CI 可用）"""
+    """通过 CDP 派发受信任鼠标事件（无需聚焦/可见窗口，Xvfb CI 可用）。
+
+    先 mouseMoved 再 press/release: Turnstile 会检查 checkbox 上是否有过
+    指针移动，只发 press/release 容易被判定为非人类操作。
+    """
+    _ensure_connected(sb)
     try:
+        sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": float(x), "y": float(y)
+        })
+        time.sleep(0.12)
         sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
             "type": "mousePressed", "x": float(x), "y": float(y),
             "button": "left", "clickCount": 1
@@ -545,87 +584,41 @@ def _cdp_click(sb, x, y):
         return False
 
 
-def _scroll_turnstile_into_view(sb):
-    """把页面上所有 iframe 滚入视口中心（不依赖 src 关键字）"""
+def _turnstile_box(sb):
+    """返回 .cf-turnstile 容器的视口坐标，取不到返回 None"""
     try:
-        sb.execute_script(
-            "document.querySelectorAll('iframe').forEach(function(f){try{f.scrollIntoView({block:'center'});}catch(e){}});"
-        )
-    except Exception:
-        pass
-
-
-def _find_turnstile_target(sb):
-    """遍历所有 iframe，返回 (data, box)。
-
-    data 来自 Turnstile 跨域 iframe 内注入的 window.__turnstile_data
-    （Shadow DOM checkbox 的位置比例）。不按 src 关键字过滤，避免漏掉
-    srcdoc / about:blank / 动态域名 形态的 widget。
-    若没有任何 iframe 携带 data，则回退返回 (None, 第一个可见 iframe 的 box)。
-    """
-    best_box = None
-    for iframe in sb.find_elements("iframe"):
-        try:
-            box = iframe.rect or {}
-        except Exception:
-            box = {}
-        # 跳过 Cloudflare 隐藏的 1x1 token iframe，避免无谓的跨域切换
-        if box.get("width", 0) <= 2 and box.get("height", 0) <= 2:
-            continue
-        try:
-            sb.driver.switch_to.frame(iframe)
-            try:
-                data = sb.execute_script("return window.__turnstile_data || null")
-            finally:
-                sb.driver.switch_to.default_content()
-            if data and "xRatio" in data:
-                return data, box
-            if best_box is None and box.get("width", 0) > 0:
-                best_box = box
-        except Exception:
-            try:
-                sb.driver.switch_to.default_content()
-            except Exception:
-                pass
-    if best_box is not None:
-        return None, best_box
-    return None, None
-
-
-def _read_top_turnstile_coords(sb):
-    """读取主文档(顶层框架)内 window.__turnstile_data，按视口尺寸算出点击坐标。
-    适用于 checkbox 渲染在主文档 Shadow DOM 的站点。"""
-    try:
-        res = sb.execute_script("""
-            (function(){
-                var d = window.__turnstile_data || null;
-                if (!d || typeof d.xRatio !== 'number') return null;
-                return {
-                    x: d.xRatio * window.innerWidth,
-                    y: d.yRatio * window.innerHeight
-                };
-            })()
-        """)
-        if res and "x" in res:
-            return res["x"], res["y"]
-    except Exception:
-        pass
-    return None
+        return _js(sb, _TS_BOX_JS)
+    except Exception as e:
+        print(f"⚠️ 读取 Turnstile 容器坐标异常: {e}")
+        return None
 
 
 def _altcha_checkbox_coords(sb):
-    """读取 ALTCHA widget Shadow DOM 内 checkbox 的视口坐标"""
+    """读取 ALTCHA widget 内 checkbox 的视口坐标。
+
+    优先读 open shadow root 内的 checkbox；若是 closed shadow root
+    （.shadowRoot 为 null，和 Turnstile 一样），退回宿主元素左侧偏移。
+    """
     try:
-        return sb.execute_script("""
+        return _js(sb, """
             (function(){
-                var w = document.querySelector('altcha-widget');
+                var w = document.querySelector('altcha-widget')
+                     || document.querySelector('.altcha, [class*="altcha"]');
                 if (!w) return null;
                 var root = w.shadowRoot;
                 var cb = root ? root.querySelector('input[type="checkbox"],[role="checkbox"]') : null;
-                if (!cb) return null;
-                cb.scrollIntoView({block:'center'});
-                var r = cb.getBoundingClientRect();
-                if (r.width>0 && r.height>0) return {x: r.x + r.width/2, y: r.y + r.height/2};
+                if (!cb) cb = w.querySelector('input[type="checkbox"],[role="checkbox"]');
+                if (cb) {
+                    cb.scrollIntoView({block:'center'});
+                    var r = cb.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0)
+                        return {x: r.x + r.width/2, y: r.y + r.height/2};
+                }
+                // closed shadow root: 按宿主元素左侧 + 垂直居中估算
+                w.scrollIntoView({block:'center'});
+                var hr = w.getBoundingClientRect();
+                if (hr.width > 30 && hr.height > 15)
+                    return {x: hr.x + 24, y: hr.y + hr.height/2};
                 return null;
             })()
         """)
@@ -633,121 +626,109 @@ def _altcha_checkbox_coords(sb):
         return None
 
 
-#  人机验证处理（CDP 受信任鼠标事件，精确点击 Shadow DOM 内 checkbox）
+#  失败证据留档（workflow 只上传 output/ 目录，写到别处等于丢弃）
+ARTIFACT_DIR = os.path.join(os.getcwd(), "output", "screenshots")
+
+
+def _save_artifacts(sb, tag: str):
+    """保存截图 + 页面 HTML 到 output/screenshots/，供 CI artifact 上传"""
+    try:
+        os.makedirs(ARTIFACT_DIR, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        sb.save_screenshot(f"{tag}.png", folder=ARTIFACT_DIR)
+        print(f"  🖼️ 截图已保存: output/screenshots/{tag}.png")
+    except Exception as e:
+        print(f"  ⚠️ 截图保存失败: {e}")
+    try:
+        html = sb.get_page_source() or ""
+        with open(os.path.join(ARTIFACT_DIR, f"{tag}.html"), "w") as f:
+            f.write(html)
+        print(f"  📄 页面已保存: output/screenshots/{tag}.html ({len(html)} 字节)")
+    except Exception as e:
+        print(f"  ⚠️ 页面保存失败: {e}")
+
+
+def _turnstile_diagnostics(sb, tag: str):
+    """打印 Turnstile 失败诊断，并把截图/HTML 落到 output/screenshots/"""
+    print("  ❌ Turnstile 处理失败，输出诊断信息:")
+    try:
+        d = _js(sb, _TS_DIAG_JS) or {}
+        print(f"     标题: {d.get('title')} | URL: {d.get('url')}")
+        print(f"     容器存在: {d.get('has_container')} rect={d.get('container_rect')}")
+        print(f"     input 存在: {d.get('has_input')}, token 长度: {d.get('token_len')}, "
+              f"window.turnstile: {d.get('turnstile_api')}")
+        print(f"     容器 HTML: {d.get('container_html')}")
+        print(f"     普通 DOM 内 iframe ({len(d.get('light_dom_iframes') or [])} 个, "
+              f"widget 在 closed shadow root 里，这里看不到是正常的):")
+        for line in (d.get('light_dom_iframes') or []):
+            print(f"       - {line}")
+        print("     Cloudflare 请求:")
+        for line in (d.get('cf_resources') or []):
+            print(f"       - {line}")
+    except Exception as e:
+        print(f"     诊断获取异常: {e}")
+    _save_artifacts(sb, tag)
+
+
+#  人机验证处理（CDP 受信任鼠标事件，点击 closed shadow root 内的 checkbox）
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
+    _ensure_connected(sb)
 
-    # 尝试展开 Turnstile（防止被父容器 overflow:hidden 裁剪）
-    for _ in range(3):
-        try: sb.execute_script(_EXPAND_JS)
-        except Exception: pass
-        time.sleep(0.5)
+    # 阶段 0: 等 widget 渲染出来（api.js 是 async，容器有尺寸才说明渲染完成）
+    box = None
+    for i in range(15):
+        box = _turnstile_box(sb)
+        if box:
+            print(f"✅ 定位到 Turnstile widget: "
+                  f"({box['x']:.0f},{box['y']:.0f}) {box['w']:.0f}x{box['h']:.0f}（{i+1}s）")
+            break
+        time.sleep(1)
+    if not box:
+        print("⚠️ Turnstile widget 未渲染出可见容器")
 
-    # 阶段 1: 隐形 Turnstile 通常会自动注入 cf-turnstile-response，无需点击。
-    # 先轮询等待 token 出现（最多 ~25 秒），这是 CI / 无显示环境下唯一可靠的通过方式。
-    print("⏳ 等待 Turnstile 自动通过（隐形验证，无需点击）...")
-    for i in range(25):
-        if sb.execute_script(_SOLVED_JS):
+    # 阶段 1: managed / 隐形模式可能自动放行，先短暂等待，避免多余点击
+    print("⏳ 等待 Turnstile 自动通过...")
+    for i in range(8):
+        if _js(sb, _SOLVED_JS):
             print(f"✅ Turnstile 已自动通过（{i+1}s）")
             return True
         time.sleep(1)
 
-    # 阶段 2: 交互式挑战 —— 通过 CDP 派发受信任鼠标事件，
-    # 精确点击 Shadow DOM 内的 checkbox（无需聚焦窗口，CI/headless 可用）。
-    print("⚠️ 未自动通过，使用 CDP 真实点击 Turnstile checkbox...")
-    for attempt in range(10):
-        if sb.execute_script(_SOLVED_JS):
-            print(f"✅ Turnstile 通过（第 {attempt} 次尝试）")
+    # 阶段 2: 点击 checkbox。checkbox 位于容器左侧、垂直居中，
+    # 实测偏移约 21px；不同 data-size 略有差异，逐次尝试几个偏移值。
+    print("⚠️ 未自动通过，CDP 点击 Turnstile checkbox...")
+    x_offsets = (24, 30, 18, 36)
+    for attempt in range(4):
+        if _js(sb, _SOLVED_JS):
+            print("✅ Turnstile 已通过")
             return True
 
-        # 重新展开并滚动到视口内（iframe 可能已重渲染）
-        try: sb.execute_script(_EXPAND_JS)
-        except Exception: pass
-        try: _scroll_turnstile_into_view(sb)
-        except Exception: pass
+        box = _turnstile_box(sb) or box
+        if not box:
+            print(f"⚠️ 取不到 Turnstile 容器坐标，无法点击 [尝试 {attempt + 1}]")
+            time.sleep(2)
+            continue
 
-        # 优先: checkbox 在主文档 Shadow DOM（顶层框架）
-        top = _read_top_turnstile_coords(sb)
-        if top:
-            print(f"🖱️ CDP 点击 Turnstile 主文档 checkbox ({top[0]:.1f},{top[1]:.1f}) [尝试 {attempt + 1}]")
-            _cdp_click(sb, top[0], top[1])
-        else:
-            # 回退: checkbox 在跨域 iframe 内
-            data, box = _find_turnstile_target(sb)
-            if data and box:
-                clickX = box["x"] + box["width"] * data["xRatio"]
-                clickY = box["y"] + box["height"] * data["yRatio"]
-                print(f"🖱️ CDP 点击 Turnstile ({clickX:.1f},{clickY:.1f}) [尝试 {attempt + 1}]")
-                _cdp_click(sb, clickX, clickY)
-            elif box:
-                # 取不到内部比例时，回退为点击 iframe 中心
-                print(f"🖱️ CDP 点击 Turnstile iframe 中心 [尝试 {attempt + 1}]")
-                _cdp_click(sb, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            else:
-                # 完全取不到坐标时回退到 SeleniumBase 内置点击
-                print("⚠️ 未取得 Turnstile 坐标，回退 uc_gui_click_captcha [尝试 {0}]".format(attempt + 1))
-                try:
-                    sb.uc_gui_click_captcha()
-                except Exception as e:
-                    print(f"⚠️ uc_gui_click_captcha 调用异常: {e}")
+        dx = x_offsets[attempt % len(x_offsets)]
+        cx = box["x"] + dx
+        cy = box["y"] + box["h"] / 2
+        print(f"🖱️ CDP 点击 ({cx:.0f},{cy:.0f}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
+        _cdp_click(sb, cx, cy)
 
-        # 等待验证结果（最多 8 秒）
-        for _ in range(16):
+        # 等待验证结果（最多 12 秒；实测通过时约 1.5 秒）
+        for _ in range(24):
             time.sleep(0.5)
-            if sb.execute_script(_SOLVED_JS):
-                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
+            if _js(sb, _SOLVED_JS):
+                token_len = _js(sb, _TOKEN_LEN_JS)
+                print(f"✅ Turnstile 通过（第 {attempt + 1} 次尝试，token 长度 {token_len}）")
                 return True
 
         print(f"⚠️ 第 {attempt + 1} 次未通过，重试...")
 
-    # 诊断信息: 输出 token 长度与页面状态，便于后续排查
-    print("  ❌ Turnstile 处理失败，输出诊断信息:")
-    try:
-        diag = sb.execute_script("""
-            (function(){
-                var i = document.querySelector('input[name="cf-turnstile-response"]');
-                var info = {
-                    has_input: !!i,
-                    token_len: i ? (i.value || '').length : -1,
-                    title: document.title
-                };
-                // 列出所有 iframe 的 src 与位置
-                var iframes = document.querySelectorAll('iframe');
-                info.iframe_count = iframes.length;
-                info.iframes = [];
-                for (var k = 0; k < iframes.length; k++) {
-                    var f = iframes[k];
-                    var r = f.getBoundingClientRect();
-                    var src = f.src || f.getAttribute('src') || '(empty)';
-                    info.iframes.push({
-                        src: src.slice(0, 90),
-                        x: Math.round(r.x), y: Math.round(r.y),
-                        w: Math.round(r.width), h: Math.round(r.height)
-                    });
-                }
-                // 每个 iframe 内是否设置了 __turnstile_data
-                info.ts_data = [];
-                return info;
-            })()
-        """)
-        print(f"     Turnstile input 存在: {diag.get('has_input')}, token 长度: {diag.get('token_len')}, 标题: {diag.get('title')}")
-        print(f"     iframe 数量: {diag.get('iframe_count')}")
-        for f in (diag.get('iframes') or []):
-            print(f"       iframe src={f['src']} rect=({f['x']},{f['y']},{f['w']}x{f['h']})")
-        # 跨域读取每个 iframe 内的 __turnstile_data
-        try:
-            for iframe in sb.find_elements("iframe"):
-                try:
-                    sb.driver.switch_to.frame(iframe)
-                    d = sb.execute_script("return window.__turnstile_data || null")
-                finally:
-                    sb.driver.switch_to.default_content()
-                print(f"       iframe __turnstile_data = {d}")
-        except Exception as e:
-            print(f"     读取 iframe 内 data 异常: {e}")
-    except Exception as e:
-        print(f"     诊断获取异常: {e}")
-    sb.save_screenshot("turnstile_fail.png")
+    _turnstile_diagnostics(sb, "turnstile_fail")
     return False
 
 
@@ -782,7 +763,7 @@ def login(sb, email: str, password: str) -> bool:
             page_title = sb.get_title() or ""
             print(f"  当前 URL: {cur_url}")
             print(f"  当前标题: {page_title}")
-            sb.save_screenshot("login_load_fail.png")
+            _save_artifacts(sb, "login_load_fail")
             return False
 
     print("🍪 关闭可能的 Cookie 弹窗...")
@@ -807,7 +788,7 @@ def login(sb, email: str, password: str) -> bool:
     print("⏳ 等待 Turnstile 验证框出现...")
     ts_found = False
     for i in range(10):
-        if sb.execute_script(_EXISTS_JS):
+        if _js(sb, _EXISTS_JS):
             ts_found = True
             print(f"✅ 检测到 Turnstile（{i+1}s）")
             break
@@ -816,30 +797,37 @@ def login(sb, email: str, password: str) -> bool:
     if ts_found:
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
-            sb.save_screenshot("login_turnstile_fail.png")
             return False
     else:
         print("ℹ️ 未检测到 Turnstile")
 
-    print("🖱️ 敲击回车提交表单...")
-    sb.press_keys('input[name="password"]', '\n')
+    print("🖱️ 提交登录表单...")
+    try:
+        sb.click("button#submit")
+    except Exception:
+        sb.press_keys('input[name="password"]', '\n')
+
+    def _logged_in():
+        url = (sb.get_current_url() or "").split('?')[0].lower()
+        title = (sb.get_title() or "").lower()
+        return url.startswith(f"{BASE_URL.lower()}/dashboard") or "dashboard | katabump" in title
 
     print("⏳ 等待登录跳转...")
-    for _ in range(12):
+    for _ in range(15):
         time.sleep(1)
-        cur_url = sb.get_current_url().split('?')[0].lower()
-        page_title = sb.get_title() or ""
-        if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
+        if _logged_in():
             break
 
-    cur_url = sb.get_current_url().split('?')[0].lower()
     page_title = sb.get_title() or ""
-    if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
+    if _logged_in():
         print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
         return True
 
     print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
-    sb.save_screenshot("login_failed.png")
+    alert_text = _read_alert(sb)
+    if alert_text:
+        print(f"  页面提示: {alert_text}")
+    _save_artifacts(sb, "login_failed")
     return False
 
 
@@ -854,7 +842,7 @@ def _read_alert(sb):
         return ""
 
 
-def _goto_server_detail(sb) -> bool:
+def _goto_server_detail(sb, email=EMAIL) -> bool:
     """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
     print("\n🖥️  正在进入服务器续期页...")
     time.sleep(5)
@@ -863,7 +851,7 @@ def _goto_server_detail(sb) -> bool:
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
-        send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
+        send_tg_message("⏳", "未到续期时间", alert_text, email=email)
         return False
 
     # 多种选择器尝试查找 See 链接
@@ -912,8 +900,8 @@ def _goto_server_detail(sb) -> bool:
                     print(f"       - [{txt}] -> {href}")
         except Exception:
             pass
-        sb.save_screenshot("servers_page_fail.png")
-        return False
+        _save_artifacts(sb, "servers_page_fail")
+        raise RenewError("Dashboard 上找不到进入服务器详情页的 'See' 链接")
 
     print("🖱️  点击 'See' 进入服务器详情页...")
     see_link.click()
@@ -932,7 +920,8 @@ def _open_renew_modal(sb) -> bool:
             renew_btn = sb.find_element('button.btn.btn-outline-primary', timeout=5)
         except Exception:
             print("  ❌ 未找到 Renew 按钮")
-            return False
+            _save_artifacts(sb, "renew_button_missing")
+            raise RenewError("服务器详情页找不到 Renew 按钮")
 
     sb.execute_script("""
         (function(){
@@ -952,7 +941,8 @@ def _open_renew_modal(sb) -> bool:
         return True
     except Exception:
         print("⚠️ 模态框未弹出")
-        return False
+        _save_artifacts(sb, "renew_modal_missing")
+        raise RenewError("点击 Renew 后模态框没有弹出")
 
 
 def _solve_altcha(sb) -> bool:
@@ -961,14 +951,14 @@ def _solve_altcha(sb) -> bool:
     time.sleep(2)
 
     # 先检查是否已自动通过
-    if sb.execute_script(_ALTCHA_SOLVED_JS):
+    if _js(sb, _ALTCHA_SOLVED_JS):
         print("✅ ALTCHA 已自动通过")
         return True
 
     # 展开模态框内 iframe 并获取坐标
     coords = None
     try:
-        coords = sb.execute_script(_ALTCHA_EXPAND_JS)
+        coords = _js(sb, _ALTCHA_EXPAND_JS)
     except Exception:
         pass
 
@@ -977,7 +967,7 @@ def _solve_altcha(sb) -> bool:
 
     # 最多尝试 3 轮
     for attempt in range(3):
-        if sb.execute_script(_ALTCHA_SOLVED_JS):
+        if _js(sb, _ALTCHA_SOLVED_JS):
             print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
             return True
 
@@ -998,9 +988,12 @@ def _solve_altcha(sb) -> bool:
             """)
         # 策略 B: xdotool 物理点击 iframe 坐标
         elif coords:
+            wi = None
             try:
-                wi = sb.execute_script(_WININFO_JS)
+                wi = _js(sb, _WININFO_JS)
             except Exception:
+                pass
+            if not wi:
                 wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
             bar = wi["oh"] - wi["ih"]
             ax  = coords["cx"] + wi["sx"]
@@ -1040,20 +1033,21 @@ def _solve_altcha(sb) -> bool:
         # 等待验证结果
         for _ in range(6):
             time.sleep(1)
-            if sb.execute_script(_ALTCHA_SOLVED_JS):
+            if _js(sb, _ALTCHA_SOLVED_JS):
                 print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮）")
                 return True
 
         print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
         # 重新获取坐标（iframe 可能已重新渲染）
         try:
-            new_coords = sb.execute_script(_ALTCHA_EXPAND_JS)
+            new_coords = _js(sb, _ALTCHA_EXPAND_JS)
             if new_coords:
                 coords = new_coords
         except Exception:
             pass
 
     print("  ❌ ALTCHA 3 轮均失败")
+    _save_artifacts(sb, "altcha_fail")
     return False
 
 
@@ -1076,67 +1070,81 @@ def _submit_renew(sb):
     time.sleep(3)
 
 
-def _check_renew_result(sb, email=EMAIL):
-    """读取页面 alert 提示，判断续期结果并推送 TG 通知"""
+def _check_renew_result(sb, email=EMAIL) -> str:
+    """读取页面 alert 提示，判断续期结果并推送 TG 通知。
+
+    返回 "ok"（续期成功）/ "skip"（未到续期时间）/ "error"（无法确认结果）。
+    """
     print("\n📋 检查续期结果...")
     alert_text = _read_alert(sb)
     if not alert_text:
         time.sleep(3)
         alert_text = _read_alert(sb)
 
-    if alert_text:
-        print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text, email=email)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
-            send_tg_message("✅", "续期成功", alert_text, email=email)
-        else:
-            send_tg_message("ℹ️", "续期操作已执行", alert_text, email=email)
-    else:
-        print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示", email=email)
+    if not alert_text:
+        print("❌ 未检测到任何提示框，无法确认续期是否生效")
+        _save_artifacts(sb, "renew_no_alert")
+        return "error"
+
+    print(f"📩 页面提示: {alert_text}")
+    low = alert_text.lower()
+    if "can't renew" in low or "unable" in low:
+        send_tg_message("⏳", "未到续期时间", alert_text, email=email)
+        return "skip"
+    if any(kw in low for kw in ("renewed", "success", "extended")):
+        send_tg_message("✅", "续期成功", alert_text, email=email)
+        return "ok"
+    print("❌ 提示内容无法判定为成功")
+    _save_artifacts(sb, "renew_unknown_alert")
+    send_tg_message("❌", "续期结果异常", alert_text, email=email)
+    return "error"
 
 
-def renew_server(sb, email=EMAIL):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+def renew_server(sb, email=EMAIL) -> str:
+    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交。
+
+    返回 "ok" / "skip"；出错时抛 RenewError 中断整个流程。
+    """
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
-    if not _goto_server_detail(sb):
-        return
+    # 返回 False 表示页面顶部已提示「还没到续期时间」，属正常情况
+    if not _goto_server_detail(sb, email=email):
+        return "skip"
 
-    if not _open_renew_modal(sb):
-        return
+    _open_renew_modal(sb)
 
-    altcha_ok = _solve_altcha(sb)
-    if not altcha_ok:
-        print("⚠️ ALTCHA 验证未通过，仍尝试提交 Renew...")
+    if not _solve_altcha(sb):
+        raise RenewError("续期弹窗的 ALTCHA 人机验证未通过")
 
     _submit_renew(sb)
-    _check_renew_result(sb, email=email)
+    status = _check_renew_result(sb, email=email)
+    if status == "error":
+        raise RenewError("已提交 Renew，但页面未返回可识别的成功提示")
+    return status
 
 
 #  脚本执行入口 (可选代理)
 def process_account(sb, user):
-    """处理单个账号的登录与续期，返回 (login_ok, renew_ok)"""
+    """处理单个账号的登录与续期。
+
+    返回 (login_ok, status)，status 为 "ok" / "skip" / ""（登录失败时）。
+    续期环节出错会抛 RenewError。
+    """
     email = user.get("username") or user.get("email") or ""
     password = user.get("password") or ""
     print("#" * 25)
     print(f"   处理账号: {email}")
     print("#" * 25)
     if not email or not password:
-        print("⚠️ 账号缺少 username 或 password，跳过")
-        return False, False
+        raise RenewError(f"账号配置缺少 username 或 password: {email or '(空)'}")
 
-    login_ok = login(sb, email, password)
-    if login_ok:
-        renew_server(sb, email=email)
-        return True, True
-    else:
+    if not login(sb, email, password):
         print(f"\n❌ 账号 {email} 登录失败。")
-        return False, False
+        return False, ""
+
+    return True, renew_server(sb, email=email)
 
 
 def main():
@@ -1146,8 +1154,7 @@ def main():
 
     users = load_users()
     if not users:
-        print("❌ 未配置任何账号（USERS_JSON / KATABUMP_EMAIL）。")
-        return
+        raise RenewError("未配置任何账号（USERS_JSON / KATABUMP_EMAIL）")
     print(f"📋 共读取到 {len(users)} 个账号")
 
     sub_url = os.environ.get("SUB_URL") or ""
@@ -1183,93 +1190,106 @@ def main():
     else:
         print("🌐 未使用代理，直连访问")
 
-    stats = {"success": 0, "failed": 0, "skipped": 0}
+    stats = {"processed": 0, "success": 0, "skipped": 0}
     total = len(users)
 
-    for idx, user in enumerate(users, start=1):
-        email = user.get("username") or user.get("email") or ""
-        print(f"\n{'=' * 25}")
-        print(f"  [{idx}/{total}] {email}")
-        print(f"{'=' * 25}")
+    try:
+        for idx, user in enumerate(users, start=1):
+            email = user.get("username") or user.get("email") or ""
+            print(f"\n{'=' * 25}")
+            print(f"  [{idx}/{total}] {email}")
+            print(f"{'=' * 25}")
 
-        account_success = False
-        used_node = "DIRECT"
+            stats["processed"] += 1
+            status = None
 
-        for attempt in range(max_retries):
-            if attempt > 0:
-                print(f"\n  [重试 {attempt + 1}/{max_retries}]")
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    print(f"\n  [重试 {attempt + 1}/{max_retries}]")
 
-            # 切换代理节点
-            if use_mihomo and proxy_pool:
-                node_name = proxy_pool[proxy_index % len(proxy_pool)]
-                used_node = node_name
-                proxy_index += 1
-                switch_mihomo_proxy(node_name)
-                time.sleep(1)
+                # 切换代理节点
+                if use_mihomo and proxy_pool:
+                    node_name = proxy_pool[proxy_index % len(proxy_pool)]
+                    proxy_index += 1
+                    switch_mihomo_proxy(node_name)
+                    time.sleep(1)
 
-            # 构建浏览器参数
-            sb_kwargs = {"uc": True, "headless": False}
-            if use_mihomo:
-                sb_kwargs["proxy"] = f"http://127.0.0.1:{MIHOMO_MIXED_PORT}"
-            elif is_proxy:
-                sb_kwargs["proxy"] = proxy_str
+                # 构建浏览器参数
+                sb_kwargs = {"uc": True, "headless": False}
+                if use_mihomo:
+                    sb_kwargs["proxy"] = f"http://127.0.0.1:{MIHOMO_MIXED_PORT}"
+                elif is_proxy:
+                    sb_kwargs["proxy"] = proxy_str
 
-            with SB(**sb_kwargs) as sb:
-                # 注入钩子
-                try:
-                    sb.driver.execute_cdp_cmd(
-                        "Page.addScriptToEvaluateOnNewDocument",
-                        {"source": _TURNSTILE_HOOK_JS}
-                    )
-                except Exception:
-                    pass
-                try:
-                    sb.set_window_size(1280, 720)
-                except Exception:
-                    pass
+                # 出口 IP 用 requests 走同一个代理查，不要用浏览器:
+                # UC 模式下 sb.open() 会把驱动切进 CDP 模式并断开连接，
+                # 之后 execute_script 的语义、execute_cdp_cmd 的可用性全变，
+                # 白白给后面的验证码环节埋坑。
+                print(f"  📍 出口IP: {_check_exit_ip(sb_kwargs.get('proxy'))}")
 
-                # 检查出口 IP
-                try:
-                    sb.open("https://api.ip.sb/ip")
-                    ip = sb.get_text("body").strip()
-                    print(f"  📍 出口IP: {ip}")
-                except Exception:
-                    pass
+                with SB(**sb_kwargs) as sb:
+                    # 不注入任何 prototype 钩子: 改写 Element.prototype.attachShadow /
+                    # MouseEvent.prototype.screenX 会让 toString() 不再是 [native code]，
+                    # 属于 Cloudflare 一眼就能识别的篡改特征，而且对定位 widget 毫无帮助
+                    # （widget 的 checkbox 在跨域 iframe 内部，不在顶层 shadow root 里）。
+                    # 窗口略高一些，保证 Turnstile widget 落在视口内（CDP 点击用视口坐标）
+                    try:
+                        sb.set_window_size(1280, 900)
+                    except Exception:
+                        pass
 
-                # 执行登录 + 续期
-                try:
-                    login_ok, renew_ok = process_account(sb, user)
+                    # 执行登录 + 续期。
+                    # 只有「登录失败」才重试（可能是节点问题）；
+                    # 其它任何异常都属于真错误，留档后立即向上抛，中断整个流程。
+                    try:
+                        login_ok, status = process_account(sb, user)
+                    except RenewError:
+                        raise
+                    except Exception:
+                        print("  ❌ 执行过程中出现未预期异常:")
+                        traceback.print_exc()
+                        try:
+                            _save_artifacts(sb, f"exception_{idx}")
+                        except Exception:
+                            pass
+                        raise
+
                     if login_ok:
-                        account_success = True
                         break  # 登录成功，不再重试
-                    # 登录失败可能是凭证问题，但也可能是节点问题
-                    # 如果有多个节点，继续重试
-                    if max_retries <= 1:
-                        break
-                except Exception as e:
-                    print(f"  ⚠️ 异常: {e}")
-                    traceback.print_exc()
+                    if attempt == max_retries - 1:
+                        send_tg_message("❌", "登录失败", f"{max_retries} 次尝试均未成功",
+                                        email=email)
+                        raise RenewError(
+                            f"账号 {email} 在 {max_retries} 次尝试后仍然登录失败")
 
-        if account_success:
-            stats["success"] += 1
-            print(f"  ✅ {email} 处理完成")
-        else:
-            stats["failed"] += 1
-            print(f"  ❌ {email} 全部 {max_retries} 次尝试失败")
-            try:
-                send_tg_message("❌", "全部失败", f"{max_retries}次尝试", email=email)
-            except Exception:
-                pass
-
-    # 汇总
-    print(f"\n{'=' * 40}")
-    print(f"📊 执行完毕: 总计 {total}, 成功 {stats['success']}, 失败 {stats['failed']}")
-    print(f"{'=' * 40}")
-
-    # 清理 Mihomo
-    if use_mihomo:
-        stop_mihomo()
+            if status == "skip":
+                stats["skipped"] += 1
+                print(f"  ⏳ {email} 未到续期时间，跳过")
+            else:
+                stats["success"] += 1
+                print(f"  ✅ {email} 续期完成")
+    finally:
+        # 无论成功失败都打印汇总并清理 Mihomo
+        failed = stats["processed"] - stats["success"] - stats["skipped"]
+        pending = total - stats["processed"]
+        print(f"\n{'=' * 40}")
+        print(f"📊 总计 {total}, 成功 {stats['success']}, 跳过 {stats['skipped']}, "
+              f"失败 {failed}, 未处理 {pending}")
+        print(f"{'=' * 40}")
+        if use_mihomo:
+            stop_mihomo()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RenewError as e:
+        print(f"\n❌ 执行中断: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n⚠️ 已被手动中断")
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n❌ 未预期异常，执行中断: {e}")
+        traceback.print_exc()
+        sys.exit(1)

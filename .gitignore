@@ -1,0 +1,7 @@
+output/
+mihomo
+mihomo.log
+config.yaml
+sub1.yaml
+*.png
+__pycache__/
