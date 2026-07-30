@@ -796,8 +796,8 @@ def handle_turnstile(sb) -> bool:
         except Exception:
             pass
 
-    # 策略 D: 回退到手动 CDP 点击（最后手段）
-    print("⚠️ 内置方法均失败，回退到手动 CDP 点击...")
+    # 策略 D: 回退到 xdotool 物理点击（真正的 OS 级输入事件）
+    print("⚠️ 内置方法均失败，回退到 xdotool 物理点击...")
     x_offsets = (24, 30, 18, 36)
     for attempt in range(4):
         if _js(sb, _SOLVED_JS):
@@ -811,17 +811,17 @@ def handle_turnstile(sb) -> bool:
             continue
 
         dx = x_offsets[attempt % len(x_offsets)]
-        cx = box["x"] + dx
-        cy = box["y"] + box["h"] / 2
-        print(f"🖱️ CDP 点击 ({cx:.0f},{cy:.0f}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
-        _cdp_click(sb, cx, cy)
+        cx = int(box["x"] + dx)
+        cy = int(box["y"] + box["h"] / 2)
+        print(f"🖱️ xdotool 点击 ({cx},{cy}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
+        _xdotool_click(cx, cy)
 
         # 等待验证结果
         for _ in range(24):
             time.sleep(0.5)
             if _js(sb, _SOLVED_JS):
                 token_len = _js(sb, _TOKEN_LEN_JS)
-                print(f"✅ Turnstile 通过（CDP 点击，token 长度 {token_len}）")
+                print(f"✅ Turnstile 通过（xdotool 点击，token 长度 {token_len}）")
                 return True
 
         # reset widget
