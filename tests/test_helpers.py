@@ -642,6 +642,68 @@ class TestHealthCheck(unittest.TestCase):
         self.assertEqual(captured, {}, "没有节点时不该发请求")
 
 
+class TestPickNode(unittest.TestCase):
+    """节点挑选: 优先复用已验证能过 Turnstile 的出口"""
+
+    POOL = ["n0", "n1", "n2"]
+
+    def test_rotates_when_nothing_known_good(self):
+        self.assertEqual(renew._pick_node(self.POOL, 0, 0, None), ("n0", 1, False))
+        self.assertEqual(renew._pick_node(self.POOL, 1, 0, None), ("n1", 2, False))
+
+    def test_reuses_known_good_on_first_attempt(self):
+        # 复用时不推进轮换下标，免得白白跳过一个还没试过的节点
+        self.assertEqual(renew._pick_node(self.POOL, 1, 0, "good"), ("good", 1, True))
+
+    def test_falls_back_to_rotation_on_retry(self):
+        # 重试说明复用的那个也不灵了，别死磕
+        self.assertEqual(renew._pick_node(self.POOL, 1, 1, "good"), ("n1", 2, False))
+
+    def test_wraps_around_pool(self):
+        name, index, _ = renew._pick_node(self.POOL, 3, 0, None)
+        self.assertEqual((name, index), ("n0", 4))
+
+    def test_known_good_need_not_be_in_pool(self):
+        # 复用的节点来自上一个账号，不要求它还在当前轮换位置上
+        name, _, reused = renew._pick_node(self.POOL, 0, 0, "从别处来的节点")
+        self.assertEqual(name, "从别处来的节点")
+        self.assertTrue(reused)
+
+
+class TestCookiesPath(unittest.TestCase):
+    """cookie 文件按账号隔离 —— 撞名会导致串号登录"""
+
+    def test_distinguishes_same_local_part(self):
+        # 只取 @ 前面那段的老做法会让这两个账号共用一个文件
+        a = renew._cookies_path("account@example.com")
+        b = renew._cookies_path("account@other.com")
+        self.assertNotEqual(a, b)
+
+    def test_stable_for_same_email(self):
+        self.assertEqual(renew._cookies_path("a@b.com"),
+                         renew._cookies_path("a@b.com"))
+
+    def test_case_and_space_insensitive(self):
+        self.assertEqual(renew._cookies_path("A@B.com"),
+                         renew._cookies_path(" a@b.com "))
+
+    def test_lands_in_cookies_dir_as_json(self):
+        p = renew._cookies_path("someone@example.com")
+        self.assertEqual(os.path.dirname(p), renew.COOKIES_DIR)
+        self.assertTrue(p.endswith(".json"))
+
+    def test_survives_weird_local_part(self):
+        # 邮箱本地部分全是点号时也不能生成隐藏文件或空名
+        p = renew._cookies_path("...@example.com")
+        self.assertTrue(os.path.basename(p).startswith("_"),
+                        f"意外的文件名: {os.path.basename(p)}")
+
+    def test_real_accounts_do_not_collide(self):
+        paths = {renew._cookies_path(e) for e in
+                 ("xiawei.email@gmail.com", "katabump@i20.de5.net")}
+        self.assertEqual(len(paths), 2)
+
+
 class TestVersionConstants(unittest.TestCase):
     """版本号/provider 名只能有一个来源"""
 

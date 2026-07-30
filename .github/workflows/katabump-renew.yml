@@ -69,9 +69,33 @@ jobs:
         run: |
           mkdir -p output/screenshots
 
+      # 复用上次跑成功时存下的会话 cookie: 命中就直接跳过 Turnstile，
+      # 那是整个流程最不稳的一环（能否通过基本取决于出口 IP 的口碑）。
+      # 缓存 key 每次运行都不同 + restore-keys 前缀匹配，是因为缓存条目
+      # 不可覆盖，只能「每次写新的、读最近的」。
+      #
+      # cookie 是会话凭据。本仓库是 private，缓存只对本仓库的 workflow
+      # 可见，且没有任何 pull_request 触发器，所以外部 PR 读不到它。
+      # 一旦仓库转为 public，这一步要重新评估。
+      - name: Restore cookies
+        uses: actions/cache/restore@v4
+        with:
+          path: cookies
+          key: katabump-cookies-${{ github.run_id }}
+          restore-keys: |
+            katabump-cookies-
+
       - name: Run renew script
         run: |
           xvfb-run -a python renew.py
+
+      # 即使脚本失败也要存: 可能只是部分账号失败，成功那些的 cookie 依然有用
+      - name: Save cookies
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cookies
+          key: katabump-cookies-${{ github.run_id }}
 
       - name: Upload reports and screenshots
         if: always()

@@ -1,4 +1,6 @@
 output/
+# 会话凭据，绝不能提交（CI 里靠 actions/cache 跨运行传递）
+cookies/
 mihomo
 mihomo.log
 config.yaml

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import hashlib
 import os
 import re
 import sys
@@ -534,6 +535,20 @@ def test_mihomo_proxies(proxy_names: list) -> list:
     return healthy
 
 
+def _pick_node(pool: list, index: int, attempt: int, known_good) -> tuple:
+    """挑这次尝试用哪个节点，返回 (节点名, 新的轮换下标, 是否是复用)
+
+    首次尝试优先复用「上一个账号刚登录成功的那个节点」: 能否过 Turnstile
+    几乎完全取决于出口 IP 的口碑，同一份池子里有的节点首击就过、有的连试
+    4 次都不行。既然刚证明过某个出口能过，就没道理再去随机摸一个 ——
+    实测出现过第一个账号在某节点顺利登录、第二个账号被切到另一批节点上
+    连挂 5 次的情况。重试时才回到轮换，避免死磕一个已经不灵的节点。
+    """
+    if attempt == 0 and known_good:
+        return known_good, index, True
+    return pool[index % len(pool)], index + 1, False
+
+
 def switch_mihomo_proxy(name: str) -> bool:
     """切换 Mihomo 活跃节点"""
     try:
@@ -575,9 +590,19 @@ COOKIES_DIR = os.path.join(os.getcwd(), "cookies")
 
 
 def _cookies_path(email: str) -> str:
-    """Per-account cookie file path"""
-    safe_name = email.split("@")[0].replace(".", "_") + ".json"
-    return os.path.join(COOKIES_DIR, safe_name)
+    """每个账号一个 cookie 文件
+
+    文件名带上完整邮箱的哈希: 只取 @ 前面那段会让 a@x.com 和 a@y.com 落到
+    同一个文件。cookies 现在跨运行复用（CI 缓存），一旦撞名就会拿另一个
+    账号的会话去登录，属于会静默串号的那类 bug。
+    """
+    # 先归一化再派生两部分: 否则 "A@B.com" 和 " a@b.com " 哈希相同、
+    # 可读前缀却不同，同一个账号会拿到两个 cookie 文件
+    # （其中一个文件名还带着开头的空格）。
+    email = (email or "").strip().lower()
+    local = re.sub(r"[^a-z0-9_-]", "_", email.split("@")[0]) or "account"
+    digest = hashlib.sha256(email.encode()).hexdigest()[:8]
+    return os.path.join(COOKIES_DIR, f"{local}-{digest}.json")
 
 
 def _save_cookies(sb, email: str):
@@ -1652,19 +1677,24 @@ def main():
 
     stats = {"processed": 0, "success": 0, "skipped": 0}
     total = len(users)
+    # 最近一次登录成功所用的节点，跨账号复用（见 run_account 里的说明）
+    known_good_node = None
 
     def run_account(idx, user, email):
         """跑单个账号（含换节点重试），返回 "ok" / "skip"；失败抛 RenewError"""
-        nonlocal proxy_index
+        nonlocal proxy_index, known_good_node
 
         for attempt in range(max_retries):
             if attempt > 0:
                 print(f"\n  [重试 {attempt + 1}/{max_retries}]")
 
-            # 切换代理节点
+            # 切换代理节点（挑选逻辑见 _pick_node）
+            node_name = None
             if use_mihomo and proxy_pool:
-                node_name = proxy_pool[proxy_index % len(proxy_pool)]
-                proxy_index += 1
+                node_name, proxy_index, reused = _pick_node(
+                    proxy_pool, proxy_index, attempt, known_good_node)
+                if reused:
+                    print("  ♻️ 复用上个账号登录成功的节点")
                 switch_mihomo_proxy(node_name)
                 time.sleep(1)
 
@@ -1708,7 +1738,14 @@ def main():
                     raise RenewError(f"未预期异常: {e}")
 
                 if login_ok:
+                    known_good_node = node_name
                     return status
+
+                # 这个节点也过不去了，别再让它拖累后面的账号
+                if node_name and node_name == known_good_node:
+                    print("  ♻️ 复用的节点这次没过，取消复用")
+                    known_good_node = None
+
                 if attempt == max_retries - 1:
                     send_tg_message("❌", "登录失败", f"{max_retries} 次尝试均未成功",
                                     email=email)
