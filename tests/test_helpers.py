@@ -109,6 +109,120 @@ class TestTurnstileClickPoint(unittest.TestCase):
                         f"候选偏移 {renew._TS_CHECKBOX_X_OFFSETS} 没覆盖实测的 ~21px")
 
 
+class FakeMihomo:
+    """模拟 mihomo 的 provider 加载行为
+
+    真实行为（已由 CI 日志确认）: 从头扫 proxies，遇到第一个解析不了的
+    节点就整份 provider 失败，并在响应体里报那个节点的**下标**:
+      {"message":"proxy 34 error: encoding/hex: invalid byte: U+0068 'h'"}
+    """
+
+    def __init__(self, bad_names=(), fail_message=None):
+        self.bad_names = set(bad_names)
+        self.fail_message = fail_message
+        self.written = []
+        self.refreshes = 0
+
+    def write(self, proxies):
+        self.written = list(proxies)
+
+    def refresh(self):
+        self.refreshes += 1
+        if self.fail_message is not None:
+            return 503, self.fail_message
+        for i, p in enumerate(self.written):
+            if p.get("name") in self.bad_names:
+                return 503, '{"message":"proxy %d error: encoding/hex: invalid byte"}' % i
+        return 204, ""
+
+
+class TestPruneBadProxies(unittest.TestCase):
+    """坏节点剔除 —— 一个坏节点不该废掉整份订阅"""
+
+    def _proxies(self, n=6):
+        return [{"name": f"n{i}", "type": "ss", "password": f"secret{i}"} for i in range(n)]
+
+    def _run(self, fake, proxies, **kw):
+        saved = (renew._write_sub_file, renew._refresh_provider)
+        renew._write_sub_file, renew._refresh_provider = fake.write, fake.refresh
+        try:
+            return renew._prune_bad_proxies(proxies, **kw)
+        finally:
+            renew._write_sub_file, renew._refresh_provider = saved
+
+    def test_no_bad_nodes_drops_nothing(self):
+        fake = FakeMihomo()
+        kept, dropped = self._run(fake, self._proxies())
+        self.assertEqual(len(kept), 6)
+        self.assertEqual(dropped, [])
+        self.assertEqual(fake.refreshes, 1, "全好的订阅不该反复重载")
+
+    def test_drops_single_bad_node(self):
+        fake = FakeMihomo(bad_names={"n2"})
+        kept, dropped = self._run(fake, self._proxies())
+        self.assertEqual([p["name"] for p in kept], ["n0", "n1", "n3", "n4", "n5"])
+        self.assertEqual([p["name"] for p in dropped], ["n2"])
+
+    def test_handles_index_shift_across_multiple_drops(self):
+        # 删掉一个之后后面的下标会前移，必须每轮重新读 mihomo 报的下标
+        fake = FakeMihomo(bad_names={"n2", "n4"})
+        kept, dropped = self._run(fake, self._proxies())
+        self.assertEqual([p["name"] for p in kept], ["n0", "n1", "n3", "n5"])
+        self.assertEqual(sorted(p["name"] for p in dropped), ["n2", "n4"])
+
+    def test_drops_first_and_last(self):
+        fake = FakeMihomo(bad_names={"n0", "n5"})
+        kept, dropped = self._run(fake, self._proxies())
+        self.assertEqual([p["name"] for p in kept], ["n1", "n2", "n3", "n4"])
+        self.assertEqual(sorted(p["name"] for p in dropped), ["n0", "n5"])
+
+    def test_stops_on_unrelated_error(self):
+        # 不是坏节点的问题（比如文件读不到），不该盲删节点
+        fake = FakeMihomo(fail_message='{"message":"open ./sub1.yaml: no such file"}')
+        kept, dropped = self._run(fake, self._proxies())
+        self.assertEqual(len(kept), 6, "非坏节点错误不该删掉任何节点")
+        self.assertEqual(dropped, [])
+
+    def test_stops_on_out_of_range_index(self):
+        fake = FakeMihomo(fail_message='{"message":"proxy 999 error: boom"}')
+        kept, dropped = self._run(fake, self._proxies())
+        self.assertEqual(len(kept), 6)
+        self.assertEqual(dropped, [])
+
+    def test_respects_max_drops(self):
+        # 所有节点都坏时不能无限删下去
+        fake = FakeMihomo(bad_names={f"n{i}" for i in range(6)})
+        kept, dropped = self._run(fake, self._proxies(), max_drops=3)
+        self.assertEqual(len(dropped), 3)
+        self.assertEqual(len(kept), 3)
+
+    def test_writes_file_before_each_reload(self):
+        fake = FakeMihomo(bad_names={"n2"})
+        self._run(fake, self._proxies())
+        # 最后写进去的必须是剔除后的列表
+        self.assertNotIn("n2", [p["name"] for p in fake.written])
+
+
+class TestDescribeProxy(unittest.TestCase):
+    """节点描述只能给字段名，绝不能带字段值（里面是密码）"""
+
+    def test_omits_field_values(self):
+        out = renew._describe_proxy(
+            {"name": "HK01", "type": "ss", "password": "supersecret123",
+             "server": "1.2.3.4", "uuid": "abcd-efgh"})
+        self.assertNotIn("supersecret123", out)
+        self.assertNotIn("1.2.3.4", out)
+        self.assertNotIn("abcd-efgh", out)
+        # 字段名要保留，否则诊断没意义
+        self.assertIn("password", out)
+        self.assertIn("uuid", out)
+        self.assertIn("HK01", out)
+        self.assertIn("ss", out)
+
+    def test_survives_non_dict(self):
+        self.assertIn("非字典", renew._describe_proxy("garbage"))
+
+
 class TestRedaction(unittest.TestCase):
     """凭据抹除 —— 诊断输出会进公开 CI 日志，这里错了就是泄密"""
 

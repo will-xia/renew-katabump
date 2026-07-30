@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import sys
 import time
 import subprocess
@@ -9,6 +10,7 @@ import json
 import traceback
 from urllib.parse import urlparse, parse_qs
 import requests
+import yaml
 from seleniumbase import SB
 
 
@@ -27,8 +29,10 @@ MIHOMO_LOG = os.path.join(os.getcwd(), "mihomo.log")
 MIHOMO_CONTROLLER = "http://127.0.0.1:9090"
 MIHOMO_MIXED_PORT = 7890
 MIHOMO_GROUP = "MyGroup"
+MIHOMO_SUB_FILE = os.path.join(os.getcwd(), "sub1.yaml")
 
-_mihomo_proc = None  # 用于退出时清理
+_mihomo_proc = None   # 用于退出时清理
+_sub_proxies = []     # 订阅里的节点列表，坏节点会被逐个剔除
 
 
 # 需要从任何输出里抹掉的凭据。SUB_URL 本身就是凭据，而 mihomo 以
@@ -111,7 +115,18 @@ def setup_mihomo(sub_url: str) -> bool:
     except Exception as e:
         _mihomo_log(f"二进制检查异常: {e}")
 
-    # 2. 生成配置
+    # 2. 先自己把订阅拉下来写成本地文件，再让 mihomo 读这个文件。
+    #    不让它直连订阅 URL，是因为它遇到一个解析不了的节点就整份作废，
+    #    而本地文件模式下我们可以把坏节点剔掉再喂给它。
+    global _sub_proxies
+    try:
+        _sub_proxies = fetch_subscription(sub_url)
+        _write_sub_file(_sub_proxies)
+    except Exception as e:
+        _mihomo_log(f"订阅下载/解析失败: {_redact(e)}")
+        return False
+
+    # 3. 生成配置（不再包含订阅链接，配置本身也就不含凭据了）
     config_yaml = f"""
 mixed-port: {MIHOMO_MIXED_PORT}
 allow-lan: false
@@ -120,12 +135,8 @@ log-level: debug
 external-controller: 127.0.0.1:9090
 proxy-providers:
   sub1:
-    type: http
-    url: "{sub_url}"
-    interval: 3600
+    type: file
     path: ./sub1.yaml
-    headers:
-      User-Agent: ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"]
     health-check:
       enable: true
       interval: 600
@@ -147,7 +158,7 @@ rules:
         _mihomo_log(f"写入配置失败: {e}")
         return False
 
-    # 3. 语法检查
+    # 4. 语法检查
     try:
         result = subprocess.run(
             [MIHOMO_PATH, "-d", os.getcwd(), "-f", MIHOMO_CONFIG, "-t"],
@@ -160,7 +171,7 @@ rules:
     except Exception as e:
         _mihomo_log(f"配置检查异常: {e}")
 
-    # 4. 启动 Mihomo
+    # 5. 启动 Mihomo
     try:
         with open(MIHOMO_LOG, "w") as log_f:
             _mihomo_proc = subprocess.Popen(
@@ -173,7 +184,7 @@ rules:
         _mihomo_log(f"启动失败: {e}")
         return False
 
-    # 5. 等待就绪（最多 15 秒）
+    # 6. 等待就绪（最多 15 秒）
     mihomo_ready = False
     for i in range(15):
         time.sleep(1)
@@ -204,7 +215,7 @@ rules:
             pass
         # 仍然尝试继续（可能 API 延迟绑定）
 
-    # 6. 多等几秒确保完全就绪；provider 刷新交给 load_mihomo_nodes()，
+    # 7. 多等几秒确保完全就绪；provider 刷新交给 load_mihomo_nodes()，
     #    那里带退避重试，避免订阅偶发 503 就静默退化成直连。
     if mihomo_ready:
         time.sleep(3)
@@ -245,11 +256,11 @@ def get_mihomo_proxies() -> list:
         return []
 
 
-def _refresh_provider() -> int:
-    """刷新订阅 provider，返回状态码（异常返回 -1）
+def _refresh_provider() -> tuple:
+    """刷新订阅 provider，返回 (状态码, 响应体)；异常返回 (-1, 错误串)
 
-    失败时 mihomo 会在响应体里带上真正的拉取错误（超时 / 证书 / 上游状态码 /
-    YAML 解析失败等），这才是定位 503 的关键信息，务必打出来。
+    失败时 mihomo 会在响应体里带上真正的解析错误（比如
+    "proxy 34 error: encoding/hex: invalid byte"），这是定位问题的唯一线索。
     """
     try:
         r = requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=15)
@@ -257,10 +268,84 @@ def _refresh_provider() -> int:
         if r.status_code >= 300:
             detail = f" | mihomo 返回: {_redact(r.text[:300]).strip()}"
         _mihomo_log(f"刷新 provider: {r.status_code}{detail}")
-        return r.status_code
+        return r.status_code, r.text
     except Exception as e:
         _mihomo_log(f"刷新 provider 失败: {e}")
-        return -1
+        return -1, str(e)
+
+
+# 拉订阅用 clash 系 UA: 部分机场只对这类 UA 返回 Clash 格式
+_SUB_UA = "mihomo/v1.18.9"
+
+# mihomo 只报坏节点的下标，不报名字，例如:
+#   {"message":"proxy 34 error: encoding/hex: invalid byte: U+0068 'h'"}
+_BAD_PROXY_RE = re.compile(r"proxy\s+(\d+)\s+error")
+
+
+def fetch_subscription(sub_url: str) -> list:
+    """下载订阅并解析出 proxies 列表
+
+    自己下载而不是让 mihomo 直连订阅，是为了能在喂给它之前剔掉坏节点 ——
+    mihomo 只要遇到一个解析不了的节点，就会把整份 provider 判为失败，
+    198 个好节点会因为 1 个坏节点全部作废（实测就是这么挂的）。
+    """
+    r = requests.get(sub_url, headers={"User-Agent": _SUB_UA}, timeout=30)
+    r.raise_for_status()
+    data = yaml.safe_load(r.content)
+    if not isinstance(data, dict) or not isinstance(data.get("proxies"), list):
+        raise ValueError("订阅不是 Clash/mihomo YAML 格式（找不到 proxies 列表），"
+                         "可能是 base64 的 V2Ray 订阅")
+    proxies = data["proxies"]
+    _mihomo_log(f"订阅下载成功: {len(r.content)} 字节, {len(proxies)} 个节点")
+    return proxies
+
+
+def _write_sub_file(proxies: list):
+    """把节点列表写成 mihomo 的 file provider 输入"""
+    with open(MIHOMO_SUB_FILE, "w") as f:
+        yaml.safe_dump({"proxies": proxies}, f,
+                       allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+
+def _describe_proxy(p: dict) -> str:
+    """描述一个节点，只给名字/类型/字段名，不打印任何字段值（里面是密码）"""
+    if not isinstance(p, dict):
+        return f"<非字典节点: {type(p).__name__}>"
+    return (f"name={_redact(p.get('name'))!r} type={p.get('type')!r} "
+            f"字段: {','.join(sorted(str(k) for k in p.keys()))}")
+
+
+def _prune_bad_proxies(proxies: list, max_drops: int = 25) -> tuple:
+    """用 mihomo 自己的解析器逐个剔除解析不了的节点，返回 (剩余节点, 被剔除的)
+
+    每轮: 写文件 → 让 mihomo 重新加载 → 若报 "proxy N error" 就丢掉第 N 个。
+    删除会让后面的下标前移，所以每轮都重新读它报的下标，不做预测。
+    用 mihomo 的解析器当校验器，好处是判断标准和它实际加载时完全一致，
+    不需要在 Python 里重新实现一遍各种协议的字段校验。
+    """
+    dropped = []
+    for _ in range(max_drops):
+        _write_sub_file(proxies)
+        code, msg = _refresh_provider()
+        if 0 <= code < 300:
+            return proxies, dropped
+
+        m = _BAD_PROXY_RE.search(msg or "")
+        if not m:
+            _mihomo_log("⚠️ provider 报错但不是坏节点导致的，停止剔除")
+            return proxies, dropped
+
+        idx = int(m.group(1))
+        if not (0 <= idx < len(proxies)):
+            _mihomo_log(f"⚠️ mihomo 报的下标 {idx} 超出范围（共 {len(proxies)} 个），停止剔除")
+            return proxies, dropped
+
+        bad = proxies.pop(idx)
+        dropped.append(bad)
+        _mihomo_log(f"🗑️ 剔除无法解析的节点 [{idx}] {_describe_proxy(bad)}")
+
+    _mihomo_log(f"⚠️ 已连续剔除 {max_drops} 个仍未加载成功，放弃")
+    return proxies, dropped
 
 
 def _log_provider_info():
@@ -338,11 +423,19 @@ def _diagnose_subscription(sub_url: str):
 
 
 def load_mihomo_nodes(attempts: int = 4) -> list:
-    """刷新 provider 并取真实节点，失败带退避重试。
+    """让 mihomo 加载订阅并取出真实节点，失败带退避重试。
 
     判据只看「过滤后还剩几个真实节点」，不看刷新接口的返回码:
     返回 204 也可能节点列表为空，返回 503 时上一次加载的节点又可能还在。
     """
+    global _sub_proxies
+    if _sub_proxies:
+        before = len(_sub_proxies)
+        _sub_proxies, dropped = _prune_bad_proxies(_sub_proxies)
+        if dropped:
+            _mihomo_log(f"共剔除 {len(dropped)} 个无法解析的节点，"
+                        f"{before} → {len(_sub_proxies)} 个可用")
+
     for i in range(attempts):
         _refresh_provider()
         time.sleep(3)
@@ -1494,7 +1587,8 @@ def main():
             _mihomo_log(f"可用节点: {len(proxy_pool)}")
             max_retries = min(5, len(proxy_pool))
         else:
-            raise RenewError("Mihomo 启动失败，且已配置 SUB_URL，拒绝回退直连。")
+            raise RenewError("Mihomo 初始化失败（订阅下载/解析失败或进程未起来），"
+                             "且已配置 SUB_URL，拒绝回退直连。")
     elif is_proxy:
         print(f"🔗 挂载单代理: {proxy_str}")
         max_retries = 3
