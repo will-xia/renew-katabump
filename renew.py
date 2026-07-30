@@ -707,15 +707,15 @@ def handle_turnstile(sb) -> bool:
     # 手动 CDP 点击无法穿透，必须用 UC Mode 的 PyAutoGUI 模拟真实鼠标点击
     print("⚠️ 未自动通过，使用 UC Mode 内置方法点击 Turnstile checkbox...")
 
-    # 策略 A: uc_gui_click_captcha() - 使用 PyAutoGUI 模拟真实鼠标点击
+    # 策略 A: uc_gui_click_cf() - 专门针对 Cloudflare Turnstile 的 PyAutoGUI 点击
     for attempt in range(3):
         if _js(sb, _SOLVED_JS):
             print("✅ Turnstile 已通过")
             return True
 
         try:
-            print(f"🖱️  尝试 uc_gui_click_captcha() [尝试 {attempt + 1}]")
-            sb.uc_gui_click_captcha()
+            print(f"🖱️  尝试 uc_gui_click_cf() [尝试 {attempt + 1}]")
+            sb.uc_gui_click_cf()
             time.sleep(2)
 
             # 等待验证结果（最多 10 秒）
@@ -723,10 +723,10 @@ def handle_turnstile(sb) -> bool:
                 time.sleep(0.5)
                 if _js(sb, _SOLVED_JS):
                     token_len = _js(sb, _TOKEN_LEN_JS)
-                    print(f"✅ Turnstile 通过（uc_gui_click_captcha，token 长度 {token_len}）")
+                    print(f"✅ Turnstile 通过（uc_gui_click_cf，token 长度 {token_len}）")
                     return True
         except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha() 异常: {e}")
+            print(f"⚠️ uc_gui_click_cf() 异常: {e}")
 
         # reset widget 后重试
         print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
@@ -737,15 +737,15 @@ def handle_turnstile(sb) -> bool:
         except Exception as e:
             print(f"⚠️ turnstile.reset() 调用异常: {e}")
 
-    # 策略 B: solve_captcha() - 另一个内置方法
+    # 策略 B: uc_gui_click_captcha() - 通用方法，自动检测 CAPTCHA 类型
     for attempt in range(2):
         if _js(sb, _SOLVED_JS):
             print("✅ Turnstile 已通过")
             return True
 
         try:
-            print(f"🖱️  尝试 solve_captcha() [尝试 {attempt + 1}]")
-            sb.solve_captcha()
+            print(f"🖱️  尝试 uc_gui_click_captcha() [尝试 {attempt + 1}]")
+            sb.uc_gui_click_captcha()
             time.sleep(2)
 
             # 等待验证结果
@@ -753,10 +753,10 @@ def handle_turnstile(sb) -> bool:
                 time.sleep(0.5)
                 if _js(sb, _SOLVED_JS):
                     token_len = _js(sb, _TOKEN_LEN_JS)
-                    print(f"✅ Turnstile 通过（solve_captcha，token 长度 {token_len}）")
+                    print(f"✅ Turnstile 通过（uc_gui_click_captcha，token 长度 {token_len}）")
                     return True
         except Exception as e:
-            print(f"⚠️ solve_captcha() 异常: {e}")
+            print(f"⚠️ uc_gui_click_captcha() 异常: {e}")
 
         # reset widget
         try:
@@ -1283,7 +1283,7 @@ def main():
                 time.sleep(1)
 
             # 构建浏览器参数
-            sb_kwargs = {"uc": True, "headless": False}
+            sb_kwargs = {"uc": True, "headless": False, "xvfb": True}
             if use_mihomo:
                 sb_kwargs["proxy"] = f"http://127.0.0.1:{MIHOMO_MIXED_PORT}"
             elif is_proxy:
