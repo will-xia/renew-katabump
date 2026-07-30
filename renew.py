@@ -705,132 +705,164 @@ def handle_turnstile(sb) -> bool:
     # 阶段 2: 使用 SeleniumBase UC Mode 内置方法点击 checkbox
     # Turnstile widget 的 checkbox 在 closed shadow root iframe 内，
     # 手动 CDP 点击无法穿透，必须用 UC Mode 的 PyAutoGUI 模拟真实鼠标点击
+    # 如未通过，尝试 OS 级 xdotool 物理点击（与 ALTCHA 同源方案）
+    # 如仍未通过，重新加载页面并重试（模拟 Cloudflare challenge 重试流程）
     print("⚠️ 未自动通过，使用 UC Mode 内置方法点击 Turnstile checkbox...")
-
-    # 策略 A: uc_gui_click_cf() - 专门针对 Cloudflare Turnstile 的 PyAutoGUI 点击
-    for attempt in range(3):
-        if _js(sb, _SOLVED_JS):
-            print("✅ Turnstile 已通过")
-            return True
-
-        try:
-            print(f"🖱️  尝试 uc_gui_click_cf() [尝试 {attempt + 1}]")
-            sb.uc_gui_click_cf()
-            time.sleep(2)
-
-            # 等待验证结果（最多 10 秒）
-            for _ in range(20):
-                time.sleep(0.5)
+    for round_num in range(2):
+        if round_num > 0:
+            print(f"🔄 第 {round_num + 1} 轮：重新加载页面后重试...")
+            try:
+                sb.uc_open_with_reconnect(sb.get_current_url(), reconnect_time=10)
+                time.sleep(8)
+            except Exception as e:
+                print(f"⚠️ 页面重载异常: {e}")
+            # 重新等待 widget 渲染
+            box = None
+            for i in range(15):
+                box = _turnstile_box(sb)
+                if box:
+                    print(f"✅ 定位到 Turnstile widget: "
+                          f"({box['x']:.0f},{box['y']:.0f}) {box['w']:.0f}x{box['h']:.0f}（{i+1}s）")
+                    break
+                time.sleep(1)
+            # 等待自动通过
+            print("⏳ 等待 Turnstile 自动通过...")
+            for i in range(12):
                 if _js(sb, _SOLVED_JS):
-                    token_len = _js(sb, _TOKEN_LEN_JS)
-                    print(f"✅ Turnstile 通过（uc_gui_click_cf，token 长度 {token_len}）")
+                    print(f"✅ Turnstile 已自动通过（{i+1}s）")
                     return True
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_cf() 异常: {e}")
+                time.sleep(1)
 
-        # reset widget 后重试
-        print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
-        try:
-            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                    " catch(e) { return 'reset failed: ' + e.message; } })()")
-            time.sleep(2)
-        except Exception as e:
-            print(f"⚠️ turnstile.reset() 调用异常: {e}")
-
-    # 策略 B: uc_gui_click_captcha() - 通用方法，自动检测 CAPTCHA 类型
-    for attempt in range(2):
-        if _js(sb, _SOLVED_JS):
-            print("✅ Turnstile 已通过")
-            return True
-
-        try:
-            print(f"🖱️  尝试 uc_gui_click_captcha() [尝试 {attempt + 1}]")
-            sb.uc_gui_click_captcha()
-            time.sleep(2)
-
-            # 等待验证结果
-            for _ in range(20):
-                time.sleep(0.5)
-                if _js(sb, _SOLVED_JS):
-                    token_len = _js(sb, _TOKEN_LEN_JS)
-                    print(f"✅ Turnstile 通过（uc_gui_click_captcha，token 长度 {token_len}）")
-                    return True
-        except Exception as e:
-            print(f"⚠️ uc_gui_click_captcha() 异常: {e}")
-
-        # reset widget
-        try:
-            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                    " catch(e) { return 'reset failed: ' + e.message; } })()")
-            time.sleep(2)
-        except Exception:
-            pass
-
-    # 策略 C: uc_gui_handle_cf() - 使用 TAB + SPACEBAR 键盘导航点击
-    print("⚠️ 图像匹配失败，尝试 uc_gui_handle_cf() 键盘方式...")
-    for attempt in range(3):
-        if _js(sb, _SOLVED_JS):
-            print("✅ Turnstile 已通过")
-            return True
-
-        try:
-            print(f"🖱️  尝试 uc_gui_handle_cf() [尝试 {attempt + 1}]")
-            sb.uc_gui_handle_cf()
-            time.sleep(2)
-
-            # 等待验证结果
-            for _ in range(20):
-                time.sleep(0.5)
-                if _js(sb, _SOLVED_JS):
-                    token_len = _js(sb, _TOKEN_LEN_JS)
-                    print(f"✅ Turnstile 通过（uc_gui_handle_cf，token 长度 {token_len}）")
-                    return True
-        except Exception as e:
-            print(f"⚠️ uc_gui_handle_cf() 异常: {e}")
-
-        # reset widget 后重试
-        try:
-            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                    " catch(e) { return 'reset failed: ' + e.message; } })()")
-            time.sleep(2)
-        except Exception:
-            pass
-
-    # 策略 D: 回退到 xdotool 物理点击（真正的 OS 级输入事件）
-    print("⚠️ 内置方法均失败，回退到 xdotool 物理点击...")
-    x_offsets = (24, 30, 18, 36)
-    for attempt in range(4):
-        if _js(sb, _SOLVED_JS):
-            print("✅ Turnstile 已通过")
-            return True
-
-        box = _turnstile_box(sb) or box
-        if not box:
-            print(f"⚠️ 取不到 Turnstile 容器坐标，无法点击 [尝试 {attempt + 1}]")
-            time.sleep(2)
-            continue
-
-        dx = x_offsets[attempt % len(x_offsets)]
-        cx = int(box["x"] + dx)
-        cy = int(box["y"] + box["h"] / 2)
-        print(f"🖱️ xdotool 点击 ({cx},{cy}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
-        _xdotool_click(cx, cy)
-
-        # 等待验证结果
-        for _ in range(24):
-            time.sleep(0.5)
+        # 策略 A: uc_gui_click_cf() - 专门针对 Cloudflare Turnstile 的 PyAutoGUI 点击
+        for attempt in range(3):
             if _js(sb, _SOLVED_JS):
-                token_len = _js(sb, _TOKEN_LEN_JS)
-                print(f"✅ Turnstile 通过（xdotool 点击，token 长度 {token_len}）")
+                print("✅ Turnstile 已通过")
                 return True
 
-        # reset widget
-        try:
-            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                    " catch(e) { return 'reset failed: ' + e.message; } })()")
-            time.sleep(2)
-        except Exception as e:
-            print(f"⚠️ turnstile.reset() 调用异常: {e}")
+            try:
+                print(f"🖱️  尝试 uc_gui_click_cf() [尝试 {attempt + 1}]")
+                sb.uc_gui_click_cf()
+                time.sleep(2)
+
+                # 等待验证结果（最多 10 秒）
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if _js(sb, _SOLVED_JS):
+                        token_len = _js(sb, _TOKEN_LEN_JS)
+                        print(f"✅ Turnstile 通过（uc_gui_click_cf，token 长度 {token_len}）")
+                        return True
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_cf() 异常: {e}")
+
+            # reset widget 后重试
+            print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
+            try:
+                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                        " catch(e) { return 'reset failed: ' + e.message; } })()")
+                time.sleep(2)
+            except Exception as e:
+                print(f"⚠️ turnstile.reset() 调用异常: {e}")
+
+        # 策略 B: uc_gui_click_captcha() - 通用方法，自动检测 CAPTCHA 类型
+        for attempt in range(2):
+            if _js(sb, _SOLVED_JS):
+                print("✅ Turnstile 已通过")
+                return True
+
+            try:
+                print(f"🖱️  尝试 uc_gui_click_captcha() [尝试 {attempt + 1}]")
+                sb.uc_gui_click_captcha()
+                time.sleep(2)
+
+                # 等待验证结果
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if _js(sb, _SOLVED_JS):
+                        token_len = _js(sb, _TOKEN_LEN_JS)
+                        print(f"✅ Turnstile 通过（uc_gui_click_captcha，token 长度 {token_len}）")
+                        return True
+            except Exception as e:
+                print(f"⚠️ uc_gui_click_captcha() 异常: {e}")
+
+            # reset widget
+            try:
+                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                        " catch(e) { return 'reset failed: ' + e.message; } })()")
+                time.sleep(2)
+            except Exception:
+                pass
+
+        # 策略 C: uc_gui_handle_cf() - 使用 TAB + SPACEBAR 键盘导航点击
+        print("⚠️ 图像匹配失败，尝试 uc_gui_handle_cf() 键盘方式...")
+        for attempt in range(3):
+            if _js(sb, _SOLVED_JS):
+                print("✅ Turnstile 已通过")
+                return True
+
+            try:
+                print(f"🖱️  尝试 uc_gui_handle_cf() [尝试 {attempt + 1}]")
+                sb.uc_gui_handle_cf()
+                time.sleep(2)
+
+                # 等待验证结果
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if _js(sb, _SOLVED_JS):
+                        token_len = _js(sb, _TOKEN_LEN_JS)
+                        print(f"✅ Turnstile 通过（uc_gui_handle_cf，token 长度 {token_len}）")
+                        return True
+            except Exception as e:
+                print(f"⚠️ uc_gui_handle_cf() 异常: {e}")
+
+            # reset widget 后重试
+            try:
+                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                        " catch(e) { return 'reset failed: ' + e.message; } })()")
+                time.sleep(2)
+            except Exception:
+                pass
+
+        # 策略 D: 回退到 xdotool 物理点击（真正的 OS 级输入事件）
+        print("⚠️ 内置方法均失败，回退到 xdotool 物理点击...")
+        x_offsets = (24, 30, 18, 36)
+        for attempt in range(4):
+            if _js(sb, _SOLVED_JS):
+                print("✅ Turnstile 已通过")
+                return True
+
+            box = _turnstile_box(sb) or box
+            if not box:
+                print(f"⚠️ 取不到 Turnstile 容器坐标，无法点击 [尝试 {attempt + 1}]")
+                time.sleep(2)
+                continue
+
+            dx = x_offsets[attempt % len(x_offsets)]
+            cx = int(box["x"] + dx)
+            cy = int(box["y"] + box["h"] / 2)
+            print(f"🖱️ xdotool 点击 ({cx},{cy}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
+            _xdotool_click(cx, cy)
+
+            # 等待验证结果
+            for _ in range(24):
+                time.sleep(0.5)
+                if _js(sb, _SOLVED_JS):
+                    token_len = _js(sb, _TOKEN_LEN_JS)
+                    print(f"✅ Turnstile 通过（xdotool 点击，token 长度 {token_len}）")
+                    return True
+
+            # reset widget
+            try:
+                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                        " catch(e) { return 'reset failed: ' + e.message; } })()")
+                time.sleep(2)
+            except Exception as e:
+                print(f"⚠️ turnstile.reset() 调用异常: {e}")
+
+        # 这一轮所有策略都未通过，且不是最后一轮才有重试价值
+        if round_num == 0:
+            # 检测是否是 Cloudflare challenge 页面（如已加载 challenge 页面则重载更有意义）
+            # 无论如何继续重试
+            continue
 
     _turnstile_diagnostics(sb, "turnstile_fail")
     return False
