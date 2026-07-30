@@ -705,18 +705,19 @@ class TestFetchSubscription(unittest.TestCase):
         self.assertIn("proxies=1", joined)
         self.assertIn("rules=1", joined)
 
-    def test_warns_when_raw_names_far_exceed_parsed_proxies(self):
-        # 实测过的坑: 405KB 响应只解析出 15 个节点，原文里却有大量 '- name:'
-        body = (b"proxies:\n  - name: a\n    type: ss\n"
-                b"other-section:\n" + b"  - name: x\n" * 10)
-        _, logs = self._fetch(body=body, headers={"content-type": "text/plain"})
-        self.assertTrue(any("订阅结构可能变了" in m for m in logs),
-                        f"结构异常没被指出来: {logs}")
+    def test_field_sizes_explain_a_large_body_with_few_nodes(self):
+        """实测过的场景: 405KB 只有 15 个节点，大头是 rules
 
-    def test_no_warning_when_counts_line_up(self):
-        body = b"proxies:\n  - name: a\n    type: ss\n  - name: b\n    type: ss\n"
+        这条日志要能让人一眼看出「体积大但节点少」是正常还是异常。
+        """
+        body = (b"proxies:\n  - name: a\n    type: ss\n"
+                b"proxy-groups:\n  - name: G\n    type: select\n"
+                b"rules:\n" + b"  - MATCH,DIRECT\n" * 20)
         _, logs = self._fetch(body=body, headers={"content-type": "text/plain"})
-        self.assertFalse(any("结构可能变了" in m for m in logs))
+        joined = "\n".join(logs)
+        self.assertIn("proxies=1", joined)
+        self.assertIn("rules=20", joined)
+        self.assertIn("proxy-groups=1", joined)
 
 
 class TestPickNode(unittest.TestCase):

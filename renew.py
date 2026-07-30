@@ -366,15 +366,9 @@ def fetch_subscription(sub_url: str) -> list:
     _mihomo_log(f"订阅解析成功: {len(proxies)} 个节点")
 
     # 结构诊断: 只打字段名和数量，不打任何取值（里面是节点密码）。
-    # 实测遇到过 405KB 的响应只解析出 15 个节点 —— 按正常密度
-    # （196 节点 ≈ 444KB）这明显不对，说明大头不是节点列表。
-    # 光看「解析成功: 15 个节点」看不出异常，必须把结构摊开。
-    raw_names = r.content.count(b"- name:")
-    if raw_names > len(proxies) * 2:
-        _mihomo_log(
-            f"⚠️ 原文里有 {raw_names} 处 '- name:'，但 proxies 只有 "
-            f"{len(proxies)} 个 —— 订阅结构可能变了（节点被拆到别的字段下，"
-            f"或 proxies 被重复定义后覆盖）")
+    # 这条日志值钱的地方在于能一眼看出「响应很大但节点很少」是否异常 ——
+    # 实测 405KB 只有 15 个节点，摊开一看 rules=8416 才是大头，
+    # 于是可以确定不是解析问题，是订阅本身节点变少了。
     sizes = ", ".join(
         f"{k}={len(v)}" if isinstance(v, (list, dict)) else f"{k}"
         for k, v in list(data.items())[:12])
