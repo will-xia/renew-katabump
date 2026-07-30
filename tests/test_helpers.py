@@ -109,6 +109,56 @@ class TestTurnstileClickPoint(unittest.TestCase):
                         f"候选偏移 {renew._TS_CHECKBOX_X_OFFSETS} 没覆盖实测的 ~21px")
 
 
+class TestRedaction(unittest.TestCase):
+    """凭据抹除 —— 诊断输出会进公开 CI 日志，这里错了就是泄密"""
+
+    SUB = "https://sub.example.com/link/abc123def456xyz?token=secretvalue123&flag=1"
+
+    def setUp(self):
+        self._saved = set(renew._SECRETS)
+        renew._SECRETS.clear()
+        renew._register_secret(self.SUB)
+
+    def tearDown(self):
+        renew._SECRETS.clear()
+        renew._SECRETS.update(self._saved)
+
+    def test_redacts_full_url(self):
+        out = renew._redact(f"failed to fetch {self.SUB}: timeout")
+        self.assertNotIn("secretvalue123", out)
+        self.assertNotIn("abc123def456xyz", out)
+        self.assertIn("***", out)
+
+    def test_redacts_token_alone(self):
+        # mihomo 的报错里可能只带 token 那一段
+        self.assertNotIn("secretvalue123", renew._redact("bad token secretvalue123"))
+
+    def test_redacts_path_segment_alone(self):
+        self.assertNotIn("abc123def456xyz", renew._redact("path=/link/abc123def456xyz"))
+
+    def test_redacts_host(self):
+        self.assertNotIn("sub.example.com", renew._redact("dial tcp sub.example.com:443"))
+
+    def test_redacts_url_encoded_form(self):
+        import urllib.parse
+        quoted = urllib.parse.quote(self.SUB, safe="")
+        self.assertNotIn("secretvalue123", renew._redact(f"url={quoted}"))
+
+    def test_keeps_unrelated_text(self):
+        msg = "HTTP 503, 0 字节, content-type=text/html"
+        self.assertEqual(renew._redact(msg), msg)
+
+    def test_handles_none_and_exceptions(self):
+        self.assertEqual(renew._redact(None), "")
+        self.assertNotIn("secretvalue123",
+                         renew._redact(RuntimeError(f"connect {self.SUB} refused")))
+
+    def test_ignores_too_short_values(self):
+        renew._SECRETS.clear()
+        renew._register_secret("abc")          # 太短，登记会被忽略
+        self.assertEqual(renew._redact("abc def"), "abc def")
+
+
 class FakeClock:
     """虚拟时钟: 让 handle_turnstile 的等待循环瞬间跑完且结果确定"""
 

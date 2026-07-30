@@ -7,6 +7,7 @@ import time
 import subprocess
 import json
 import traceback
+from urllib.parse import urlparse, parse_qs
 import requests
 from seleniumbase import SB
 
@@ -28,6 +29,46 @@ MIHOMO_MIXED_PORT = 7890
 MIHOMO_GROUP = "MyGroup"
 
 _mihomo_proc = None  # 用于退出时清理
+
+
+# 需要从任何输出里抹掉的凭据。SUB_URL 本身就是凭据，而 mihomo 以
+# log-level: debug 运行时会把订阅 URL 打进自己的日志，所以任何要进
+# CI 日志或 artifact 的文本都得先过一遍 _redact()。
+_SECRETS: set = set()
+
+
+def _register_secret(value: str):
+    """登记一个凭据及其常见变形，供 _redact() 抹除"""
+    if not value or len(value) < 8:
+        return
+    value = value.strip()
+    _SECRETS.add(value)
+    _SECRETS.add(value.rstrip("/"))
+    try:
+        _SECRETS.add(requests.utils.quote(value, safe=""))
+        u = urlparse(value)
+        if u.netloc:
+            _SECRETS.add(u.netloc)
+        # 路径末段和 query 值往往就是 token，报错信息里可能只带这一段
+        for seg in u.path.split("/"):
+            if len(seg) >= 8:
+                _SECRETS.add(seg)
+        for vals in parse_qs(u.query).values():
+            for v in vals:
+                if len(v) >= 8:
+                    _SECRETS.add(v)
+    except Exception:
+        pass
+
+
+def _redact(text) -> str:
+    """把已登记的凭据替换成 ***（长的先替换，避免子串把长串切碎）"""
+    if text is None:
+        return ""
+    out = str(text)
+    for secret in sorted(_SECRETS, key=len, reverse=True):
+        out = out.replace(secret, "***")
+    return out
 
 
 def _mihomo_log(msg):
@@ -205,14 +246,95 @@ def get_mihomo_proxies() -> list:
 
 
 def _refresh_provider() -> int:
-    """刷新订阅 provider，返回状态码（异常返回 -1）"""
+    """刷新订阅 provider，返回状态码（异常返回 -1）
+
+    失败时 mihomo 会在响应体里带上真正的拉取错误（超时 / 证书 / 上游状态码 /
+    YAML 解析失败等），这才是定位 503 的关键信息，务必打出来。
+    """
     try:
         r = requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=15)
-        _mihomo_log(f"刷新 provider: {r.status_code}")
+        detail = ""
+        if r.status_code >= 300:
+            detail = f" | mihomo 返回: {_redact(r.text[:300]).strip()}"
+        _mihomo_log(f"刷新 provider: {r.status_code}{detail}")
         return r.status_code
     except Exception as e:
         _mihomo_log(f"刷新 provider 失败: {e}")
         return -1
+
+
+def _log_provider_info():
+    """打印 mihomo 侧的 provider 状态（节点数 / 上次更新时间）"""
+    try:
+        r = requests.get(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=10)
+        d = r.json()
+        _mihomo_log(f"provider 状态: vehicleType={d.get('vehicleType')}, "
+                    f"updatedAt={d.get('updatedAt')}, "
+                    f"节点数={len(d.get('proxies') or [])}")
+    except Exception as e:
+        _mihomo_log(f"读取 provider 状态失败: {e}")
+
+
+# 探测用的 UA。不少机场只在 UA 里含 clash/mihomo 时才返回 Clash 格式配置，
+# 否则给 4xx/5xx —— 一次性把三种都试掉，直接看出是不是 UA 的问题。
+_SUB_PROBE_UAS = (
+    ("配置当前使用的 UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+    ("mihomo UA", "mihomo/v1.18.9"),
+    ("clash UA", "ClashforWindows/0.19.23"),
+)
+
+
+def _probe_sub_url(sub_url: str):
+    """直接拉一次订阅，只报可安全公开的元信息。
+
+    刻意不打印链接和响应体正文: 链接本身是凭据，正文里是节点密码。
+    只输出状态码、长度、content-type、以及「像不像 Clash 配置」的判断。
+    subscription-userinfo 响应头是关键 —— 流量用尽或套餐过期会直接体现在这里。
+    """
+    if not sub_url:
+        return
+    _mihomo_log("订阅可达性探测（不打印链接与响应体正文）:")
+    for label, ua in _SUB_PROBE_UAS:
+        try:
+            r = requests.get(sub_url, headers={"User-Agent": ua}, timeout=20)
+            body = r.content or b""
+            text = body[:4096].decode("utf-8", "replace")
+            info = (f"HTTP {r.status_code}, {len(body)} 字节, "
+                    f"content-type={r.headers.get('content-type', '?')}, "
+                    f"含 proxies 段={'proxies:' in text}, "
+                    f"'- name:' 出现 {body.count(b'- name:')} 次")
+            userinfo = r.headers.get("subscription-userinfo")
+            if userinfo:
+                info += f", subscription-userinfo={userinfo}"
+            _mihomo_log(f"  [{label}] {info}")
+            # 错误响应一般是短 JSON/文本提示，不含节点凭据，抹掉链接后可安全打印
+            if r.status_code >= 400 and len(body) < 2000:
+                _mihomo_log(f"  [{label}] 错误正文: {_redact(text[:200]).strip()!r}")
+        except Exception as e:
+            _mihomo_log(f"  [{label}] 请求异常: {type(e).__name__}: {_redact(e)}")
+
+
+def _export_mihomo_log(lines: int = 80):
+    """把 mihomo 日志尾部抹掉凭据后落进 output/，供 CI artifact 上传"""
+    try:
+        with open(MIHOMO_LOG, errors="replace") as f:
+            tail = f.readlines()[-lines:]
+        os.makedirs(ARTIFACT_DIR, exist_ok=True)
+        dest = os.path.join(os.path.dirname(ARTIFACT_DIR), "mihomo.log")
+        with open(dest, "w") as f:
+            f.write(_redact("".join(tail)))
+        _mihomo_log(f"mihomo 日志尾部已导出: output/mihomo.log（已抹除凭据）")
+    except Exception as e:
+        _mihomo_log(f"导出 mihomo 日志失败: {e}")
+
+
+def _diagnose_subscription(sub_url: str):
+    """订阅拿不到节点时的完整诊断"""
+    _mihomo_log("=" * 20 + " 订阅诊断 " + "=" * 20)
+    _log_provider_info()
+    _probe_sub_url(sub_url)
+    _export_mihomo_log()
+    _mihomo_log("=" * 50)
 
 
 def load_mihomo_nodes(attempts: int = 4) -> list:
@@ -1337,6 +1459,9 @@ def main():
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
 
+    # 订阅链接是凭据，登记后所有诊断输出都会自动抹掉它
+    _register_secret(sub_url)
+
     # 代理模式决策: SUB_URL 优先 → IS_PROXY → 直连
     use_mihomo = False
     proxy_pool = []
@@ -1351,6 +1476,7 @@ def main():
             # 那档验证，跑满 90 分钟也过不去，还白留一条失败记录。
             all_nodes = load_mihomo_nodes()
             if not all_nodes:
+                _diagnose_subscription(sub_url)
                 stop_mihomo()
                 raise RenewError(
                     "订阅里没有任何真实节点（provider 多次刷新后代理组仍只有"
