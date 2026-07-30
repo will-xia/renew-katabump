@@ -364,6 +364,21 @@ def fetch_subscription(sub_url: str) -> list:
                          "可能是 base64 的 V2Ray 订阅")
     proxies = data["proxies"]
     _mihomo_log(f"订阅解析成功: {len(proxies)} 个节点")
+
+    # 结构诊断: 只打字段名和数量，不打任何取值（里面是节点密码）。
+    # 实测遇到过 405KB 的响应只解析出 15 个节点 —— 按正常密度
+    # （196 节点 ≈ 444KB）这明显不对，说明大头不是节点列表。
+    # 光看「解析成功: 15 个节点」看不出异常，必须把结构摊开。
+    raw_names = r.content.count(b"- name:")
+    if raw_names > len(proxies) * 2:
+        _mihomo_log(
+            f"⚠️ 原文里有 {raw_names} 处 '- name:'，但 proxies 只有 "
+            f"{len(proxies)} 个 —— 订阅结构可能变了（节点被拆到别的字段下，"
+            f"或 proxies 被重复定义后覆盖）")
+    sizes = ", ".join(
+        f"{k}={len(v)}" if isinstance(v, (list, dict)) else f"{k}"
+        for k, v in list(data.items())[:12])
+    _mihomo_log(f"订阅顶层字段: {sizes}")
     return proxies
 
 

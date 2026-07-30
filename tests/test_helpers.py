@@ -698,6 +698,26 @@ class TestFetchSubscription(unittest.TestCase):
                                  headers={"content-type": "text/plain"})
         self.assertEqual(proxies, [])
 
+    def test_logs_top_level_field_sizes(self):
+        body = b"proxies:\n  - name: a\n    type: ss\nrules:\n  - MATCH,DIRECT\n"
+        _, logs = self._fetch(body=body, headers={"content-type": "text/plain"})
+        joined = "\n".join(logs)
+        self.assertIn("proxies=1", joined)
+        self.assertIn("rules=1", joined)
+
+    def test_warns_when_raw_names_far_exceed_parsed_proxies(self):
+        # 实测过的坑: 405KB 响应只解析出 15 个节点，原文里却有大量 '- name:'
+        body = (b"proxies:\n  - name: a\n    type: ss\n"
+                b"other-section:\n" + b"  - name: x\n" * 10)
+        _, logs = self._fetch(body=body, headers={"content-type": "text/plain"})
+        self.assertTrue(any("订阅结构可能变了" in m for m in logs),
+                        f"结构异常没被指出来: {logs}")
+
+    def test_no_warning_when_counts_line_up(self):
+        body = b"proxies:\n  - name: a\n    type: ss\n  - name: b\n    type: ss\n"
+        _, logs = self._fetch(body=body, headers={"content-type": "text/plain"})
+        self.assertFalse(any("结构可能变了" in m for m in logs))
+
 
 class TestPickNode(unittest.TestCase):
     """节点挑选: 优先复用已验证能过 Turnstile 的出口"""
