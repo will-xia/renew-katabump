@@ -792,77 +792,44 @@ def handle_turnstile(sb) -> bool:
             except Exception:
                 pass
 
-        # 策略 C: uc_gui_handle_cf() - 使用 TAB + SPACEBAR 键盘导航点击
-        print("⚠️ 图像匹配失败，尝试 uc_gui_handle_cf() 键盘方式...")
-        for attempt in range(3):
-            if _js(sb, _SOLVED_JS):
-                print("✅ Turnstile 已通过")
-                return True
+    # 策略 C: 回退到 xdotool 物理点击（真正的 OS 级输入事件）
+    # Turnstile checkbox 在容器左侧、垂直居中（实测偏移约 10px）
+    print("⚠️ 内置方法均失败，回退到 xdotool 物理点击...")
+    x_offsets = (10, 14, 8, 18)
+    for attempt in range(6):
+        if _js(sb, _SOLVED_JS):
+            print("✅ Turnstile 已通过")
+            return True
 
-            try:
-                print(f"🖱️  尝试 uc_gui_handle_cf() [尝试 {attempt + 1}]")
-                sb.uc_gui_handle_cf()
-                time.sleep(2)
-
-                # 等待验证结果
-                for _ in range(20):
-                    time.sleep(0.5)
-                    if _js(sb, _SOLVED_JS):
-                        token_len = _js(sb, _TOKEN_LEN_JS)
-                        print(f"✅ Turnstile 通过（uc_gui_handle_cf，token 长度 {token_len}）")
-                        return True
-            except Exception as e:
-                print(f"⚠️ uc_gui_handle_cf() 异常: {e}")
-
-            # reset widget 后重试
-            try:
-                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                        " catch(e) { return 'reset failed: ' + e.message; } })()")
-                time.sleep(2)
-            except Exception:
-                pass
-
-        # 策略 D: 回退到 xdotool 物理点击（真正的 OS 级输入事件）
-        print("⚠️ 内置方法均失败，回退到 xdotool 物理点击...")
-        x_offsets = (24, 30, 18, 36)
-        for attempt in range(4):
-            if _js(sb, _SOLVED_JS):
-                print("✅ Turnstile 已通过")
-                return True
-
-            box = _turnstile_box(sb) or box
-            if not box:
-                print(f"⚠️ 取不到 Turnstile 容器坐标，无法点击 [尝试 {attempt + 1}]")
-                time.sleep(2)
-                continue
-
-            dx = x_offsets[attempt % len(x_offsets)]
-            cx = int(box["x"] + dx)
-            cy = int(box["y"] + box["h"] / 2)
-            print(f"🖱️ xdotool 点击 ({cx},{cy}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
-            _xdotool_click(cx, cy)
-
-            # 等待验证结果
-            for _ in range(24):
-                time.sleep(0.5)
-                if _js(sb, _SOLVED_JS):
-                    token_len = _js(sb, _TOKEN_LEN_JS)
-                    print(f"✅ Turnstile 通过（xdotool 点击，token 长度 {token_len}）")
-                    return True
-
-            # reset widget
-            try:
-                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                        " catch(e) { return 'reset failed: ' + e.message; } })()")
-                time.sleep(2)
-            except Exception as e:
-                print(f"⚠️ turnstile.reset() 调用异常: {e}")
-
-        # 这一轮所有策略都未通过，且不是最后一轮才有重试价值
-        if round_num == 0:
-            # 检测是否是 Cloudflare challenge 页面（如已加载 challenge 页面则重载更有意义）
-            # 无论如何继续重试
+        box = _turnstile_box(sb) or box
+        if not box:
+            print(f"⚠️ 取不到 Turnstile 容器坐标，无法点击 [尝试 {attempt + 1}]")
+            time.sleep(2)
             continue
+
+        dx = x_offsets[attempt % len(x_offsets)]
+        cx = int(box["x"] + dx)
+        cy = int(box["y"] + box["h"] / 2)
+        print(f"🖱️ xdotool 点击 ({cx},{cy}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
+        _xdotool_click(cx, cy)
+        # 模拟人类操作：点击后短暂停顿，让浏览器处理事件
+        time.sleep(0.5 + (time.time() % 1) * 0.3)
+
+        # 等待验证结果
+        for _ in range(30):
+            time.sleep(0.5)
+            if _js(sb, _SOLVED_JS):
+                token_len = _js(sb, _TOKEN_LEN_JS)
+                print(f"✅ Turnstile 通过（xdotool 点击，token 长度 {token_len}）")
+                return True
+
+        # reset widget
+        try:
+            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                    " catch(e) { return 'reset failed: ' + e.message; } })()")
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ turnstile.reset() 调用异常: {e}")
 
     _turnstile_diagnostics(sb, "turnstile_fail")
     return False
