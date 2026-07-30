@@ -766,7 +766,37 @@ def handle_turnstile(sb) -> bool:
         except Exception:
             pass
 
-    # 策略 C: 回退到手动 CDP 点击（最后手段）
+    # 策略 C: uc_gui_handle_cf() - 使用 TAB + SPACEBAR 键盘导航点击
+    print("⚠️ 图像匹配失败，尝试 uc_gui_handle_cf() 键盘方式...")
+    for attempt in range(3):
+        if _js(sb, _SOLVED_JS):
+            print("✅ Turnstile 已通过")
+            return True
+
+        try:
+            print(f"🖱️  尝试 uc_gui_handle_cf() [尝试 {attempt + 1}]")
+            sb.uc_gui_handle_cf()
+            time.sleep(2)
+
+            # 等待验证结果
+            for _ in range(20):
+                time.sleep(0.5)
+                if _js(sb, _SOLVED_JS):
+                    token_len = _js(sb, _TOKEN_LEN_JS)
+                    print(f"✅ Turnstile 通过（uc_gui_handle_cf，token 长度 {token_len}）")
+                    return True
+        except Exception as e:
+            print(f"⚠️ uc_gui_handle_cf() 异常: {e}")
+
+        # reset widget 后重试
+        try:
+            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                    " catch(e) { return 'reset failed: ' + e.message; } })()")
+            time.sleep(2)
+        except Exception:
+            pass
+
+    # 策略 D: 回退到手动 CDP 点击（最后手段）
     print("⚠️ 内置方法均失败，回退到手动 CDP 点击...")
     x_offsets = (24, 30, 18, 36)
     for attempt in range(4):
