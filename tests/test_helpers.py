@@ -550,45 +550,96 @@ class TestLoadMihomoNodes(unittest.TestCase):
         self.assertTrue(any("失败" in m for m in logs))
 
 
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None, text=None):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text if text is not None else str(payload)
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
 class TestHealthCheck(unittest.TestCase):
-    """并发测速: 顺序、失败原因汇总"""
+    """整组测速: /group/{组名}/delay 只返回测通的节点
 
-    def _run(self, outcomes):
-        """outcomes: {节点名: (是否健康, 原因)}"""
+    v1.19 起 provider 里的节点不再单独暴露成 /proxies/{name}，
+    逐个测速会 195/195 全 404 —— 这组用例把接口契约钉住。
+    """
+
+    def _run(self, response, names):
         logs = []
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured["url"] = url
+            captured["params"] = kwargs.get("params")
+            if isinstance(response, Exception):
+                raise response
+            return response
+
         patch_renew(self, _mihomo_log=logs.append,
-                    _node_delay=lambda n: outcomes[n])
-        names = list(outcomes)
-        return renew.test_mihomo_proxies(names, workers=4), logs
+                    requests=types.SimpleNamespace(
+                        get=fake_get,
+                        utils=types.SimpleNamespace(quote=lambda s, safe='': s)))
+        return renew.test_mihomo_proxies(names), logs, captured
 
-    def test_keeps_input_order(self):
-        # 并发返回顺序不确定，结果必须按入参顺序对齐，不能错位
-        outcomes = {f"n{i}": (i % 2 == 0, None if i % 2 == 0 else "timeout")
-                    for i in range(10)}
-        healthy, _ = self._run(outcomes)
-        self.assertEqual(healthy, ["n0", "n2", "n4", "n6", "n8"])
+    def test_uses_group_delay_endpoint(self):
+        """必须打整组接口，不能回到逐个节点的 /proxies/{name}/delay"""
+        _, _, captured = self._run(
+            FakeResponse(200, {"n0": 100}), ["n0"])
+        self.assertIn(f"/group/{renew.MIHOMO_GROUP}/delay", captured["url"])
+        self.assertNotIn("/proxies/", captured["url"])
 
-    def test_summarizes_reasons_when_all_fail(self):
-        outcomes = {"a": (False, "ReadTimeout: x"),
-                    "b": (False, "ReadTimeout: x"),
-                    "c": (False, "HTTP 400 boom")}
-        healthy, logs = self._run(outcomes)
+    def test_keeps_only_healthy_in_input_order(self):
+        # 响应里只有测通的节点，没出现的就是不通
+        healthy, _, _ = self._run(
+            FakeResponse(200, {"n2": 80, "n0": 120}),
+            ["n0", "n1", "n2", "n3"])
+        self.assertEqual(healthy, ["n0", "n2"])
+
+    def test_ignores_nodes_not_asked_for(self):
+        # 组里可能混着 DIRECT 之类，结果必须只包含入参里的节点
+        healthy, _, _ = self._run(
+            FakeResponse(200, {"DIRECT": 60, "n0": 90}), ["n0"])
+        self.assertEqual(healthy, ["n0"])
+
+    def test_reports_non_200_loudly(self):
+        # 504 = 全部超时；其它状态码通常意味着接口变了，必须能看出来
+        healthy, logs, _ = self._run(
+            FakeResponse(404, None, '{"message":"Resource not found"}'), ["n0"])
         self.assertEqual(healthy, [])
         joined = "\n".join(logs)
-        self.assertIn("无一节点测通", joined)
-        self.assertIn("2 次: ReadTimeout: x", joined)
-        self.assertIn("1 次: HTTP 400 boom", joined)
+        self.assertIn("HTTP 404", joined)
+        self.assertIn("Resource not found", joined)
 
-    def test_no_reason_dump_when_some_healthy(self):
-        outcomes = {"a": (True, None), "b": (False, "timeout")}
-        healthy, logs = self._run(outcomes)
-        self.assertEqual(healthy, ["a"])
-        self.assertNotIn("无一节点测通", "\n".join(logs))
-
-    def test_empty_input(self):
-        healthy, logs = self._run({})
+    def test_survives_request_exception(self):
+        healthy, logs, _ = self._run(RuntimeError("boom"), ["n0"])
         self.assertEqual(healthy, [])
-        self.assertNotIn("无一节点测通", "\n".join(logs))
+        self.assertTrue(any("测速请求失败" in m for m in logs))
+
+    def test_survives_non_json_body(self):
+        healthy, logs, _ = self._run(FakeResponse(200, None, "<html>"), ["n0"])
+        self.assertEqual(healthy, [])
+        self.assertTrue(any("不是 JSON" in m for m in logs))
+
+    def test_rejects_non_numeric_and_zero_delays(self):
+        healthy, _, _ = self._run(
+            FakeResponse(200, {"n0": 0, "n1": None, "n2": True, "n3": 50}),
+            ["n0", "n1", "n2", "n3"])
+        self.assertEqual(healthy, ["n3"])
+
+    def test_logs_delay_range(self):
+        _, logs, _ = self._run(
+            FakeResponse(200, {"n0": 50, "n1": 250}), ["n0", "n1"])
+        self.assertTrue(any("50~250ms" in m for m in logs))
+
+    def test_empty_input_makes_no_request(self):
+        healthy, logs, captured = self._run(FakeResponse(200, {}), [])
+        self.assertEqual(healthy, [])
+        self.assertEqual(captured, {}, "没有节点时不该发请求")
 
 
 class TestVersionConstants(unittest.TestCase):

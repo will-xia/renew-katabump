@@ -8,8 +8,6 @@ import time
 import subprocess
 import json
 import traceback
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs
 import requests
 import yaml
@@ -482,54 +480,57 @@ def load_mihomo_nodes(timeout: int = 10) -> list:
     return seen["nodes"]
 
 
-# 客户端超时要明显大于 mihomo 侧的探测超时(3s): 并发时请求会在 mihomo
-# 内部排队，客户端超时卡得太紧会把「排队中」误判成「节点不通」。
+# 整组测速: mihomo v1.19 起，provider 里的节点不再单独暴露成
+# /proxies/{name} —— /proxies 只列顶层代理（DIRECT/GLOBAL/组名 等），
+# 逐个测速会全部 404（实测 195/195 全挂在这上面）。
+#
+# 替代接口是 /group/{组名}/delay: 一次请求测完整组，mihomo 内部自己并发，
+# 只把**测通的**节点连延迟一起返回（{"节点名": 毫秒}），不通的不出现在
+# 结果里。既比发 195 个请求快，也省掉了自己管并发。
+# 全部超时时返回 504。
 _DELAY_PROBE_MS = 3000
-_DELAY_HTTP_TIMEOUT = 15
+_DELAY_HTTP_TIMEOUT = 120
 
 
-def _node_delay(name: str) -> tuple:
-    """单个节点测速，返回 (是否健康, 失败原因)"""
+def test_mihomo_proxies(proxy_names: list) -> list:
+    """让 mihomo 一次性测完整个代理组，返回健康节点（保持入参顺序）"""
+    if not proxy_names:
+        return []
+
+    _mihomo_log(f"开始对 {len(proxy_names)} 个节点测速（整组一次性测）...")
     try:
         r = requests.get(
-            f"{MIHOMO_CONTROLLER}/proxies/{requests.utils.quote(name, safe='')}/delay",
+            f"{MIHOMO_CONTROLLER}/group/"
+            f"{requests.utils.quote(MIHOMO_GROUP, safe='')}/delay",
             params={"timeout": str(_DELAY_PROBE_MS),
                     "url": "http://www.gstatic.com/generate_204"},
             timeout=_DELAY_HTTP_TIMEOUT
         )
-        data = r.json()
-        if data.get("delay"):
-            return True, None
-        # mihomo 失败时给 {"message": "..."}，这才是真正的原因
-        return False, f"HTTP {r.status_code} {str(data)[:100]}"
     except Exception as e:
-        return False, f"{type(e).__name__}: {str(e)[:100]}"
+        _mihomo_log(f"⚠️ 测速请求失败: {type(e).__name__}: {e}")
+        return []
 
+    if r.status_code != 200:
+        # 504 = 组内全部超时；其它状态码基本都是接口本身对不上
+        # （比如再次升级 mihomo 后路由又变了），必须能一眼看出来
+        _mihomo_log(f"⚠️ 测速接口返回 HTTP {r.status_code}: {r.text[:150].strip()}")
+        return []
 
-def test_mihomo_proxies(proxy_names: list, workers: int = 16) -> list:
-    """并发测速，返回健康节点列表（保持入参顺序）
+    try:
+        delays = r.json()
+    except Exception:
+        _mihomo_log(f"⚠️ 测速结果不是 JSON: {r.text[:150].strip()}")
+        return []
 
-    这里以前虽然写着「并发」，实际是串行的双层 for，batch_size 也没用上。
-    过去看不出问题是因为节点池里只有 COMPATIBLE 一个；现在是 ~195 个真实
-    节点，串行意味着每个不通的节点都要吃满 3s 超时，光测速就要 3~5 分钟。
+    def ok(name):
+        d = delays.get(name)
+        return isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0
 
-    一个都测不通时会把失败原因按类型汇总打出来 —— 「0/195 健康」这种
-    结果几乎不可能是 195 个节点同时坏掉，必然是探测方式本身有问题，
-    原因不打出来就只能靠猜。
-    """
-    _mihomo_log(f"开始对 {len(proxy_names)} 个节点测速（并发 {workers}）...")
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(_node_delay, proxy_names))
-
-    healthy = [name for name, (ok, _) in zip(proxy_names, results) if ok]
+    healthy = [n for n in proxy_names if ok(n)]
     _mihomo_log(f"测速完成，健康节点: {len(healthy)}/{len(proxy_names)}")
-
-    if not healthy and proxy_names:
-        reasons = Counter(reason for ok, reason in results if not ok)
-        _mihomo_log("⚠️ 无一节点测通，失败原因汇总:")
-        for reason, count in reasons.most_common(5):
-            _mihomo_log(f"    {count} 次: {reason}")
-
+    if healthy:
+        ds = sorted(delays[n] for n in healthy)
+        _mihomo_log(f"延迟 {ds[0]}~{ds[-1]}ms，中位 {ds[len(ds) // 2]}ms")
     return healthy
 
 
