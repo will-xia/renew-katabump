@@ -251,6 +251,64 @@ TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可�
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可选)
 
 BASE_URL = "https://dashboard.katabump.com"  # 网站链接
+COOKIES_DIR = os.path.join(os.getcwd(), "cookies")
+
+
+def _cookies_path(email: str) -> str:
+    """Per-account cookie file path"""
+    safe_name = email.split("@")[0].replace(".", "_") + ".json"
+    return os.path.join(COOKIES_DIR, safe_name)
+
+
+def _save_cookies(sb, email: str):
+    """Save browser cookies to disk for future cookie-based authentication"""
+    try:
+        os.makedirs(COOKIES_DIR, exist_ok=True)
+        cookies = sb.get_cookies()
+        if cookies:
+            path = _cookies_path(email)
+            with open(path, "w") as f:
+                json.dump(cookies, f)
+            print(f"  💾 Cookies 已保存到 {path}")
+    except Exception as e:
+        print(f"  ⚠️ 保存 cookies 失败: {e}")
+
+
+def _load_cookies(sb, email: str) -> bool:
+    """Try loading saved cookies and navigate to dashboard.
+      Returns True if cookies valid (already logged in), False otherwise.
+    """
+    path = _cookies_path(email)
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            cookies = json.load(f)
+        if not isinstance(cookies, list):
+            return False
+        # Use regular navigation so CDP session stays stable for cookie ops
+        sb.get(BASE_URL)
+        time.sleep(3)
+        for cookie in cookies:
+            try:
+                sb.add_cookie(cookie)
+            except Exception:
+                pass
+        sb.get(BASE_URL)
+        time.sleep(2)
+        url = (sb.get_current_url() or "").lower()
+        title = (sb.get_title() or "").lower()
+        if url.startswith(f"{BASE_URL.lower()}/dashboard") or "dashboard | katabump" in title:
+            print("  ✅ 使用已保存的 cookies 登录（跳过 Turnstile）")
+            return True
+    except Exception as e:
+        print(f"  ⚠️ cookies 加载失败: {e}")
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+    return False
+
 
 # 从 repository secret 读取多账号配置:
 # USERS_JSON = '[{"username": "a@b.com", "password": "pwd"}, ...]'
@@ -837,6 +895,12 @@ def handle_turnstile(sb) -> bool:
 
 #  账户登录
 def login(sb, email: str, password: str) -> bool:
+    # 尝试使用已保存的 cookies 跳过登录（跳过 Turnstile）
+    print("🔍 检查已保存的 cookies...")
+    if _load_cookies(sb, email):
+        print(f"✅ 使用 cookies 跳过登录（跳过 Turnstile）")
+        return True
+
     print(f"🌐 打开登录页面: {BASE_URL}/auth/login")
     sb.uc_open_with_reconnect(BASE_URL + "/auth/login", reconnect_time=8)
     time.sleep(8)
@@ -924,6 +988,7 @@ def login(sb, email: str, password: str) -> bool:
     page_title = sb.get_title() or ""
     if _logged_in():
         print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
+        _save_cookies(sb, email)
         return True
 
     print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
