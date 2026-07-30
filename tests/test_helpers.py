@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """renew.py 里纯计算部分的回归测试。
 
-这些用例锁死两个曾经把整个流程带进沟里的 bug:
+这些用例锁死几个曾经把整个流程带进沟里的 bug:
 
   1. Mihomo 的 COMPATIBLE 占位节点被当成真实节点，导致「有健康节点」的
      假象，实际流量从 runner 自己的数据中心 IP 直连出去。
   2. xdotool 点击直接用视口坐标，少加浏览器工具栏高度，每一次点击都
-     落在 Turnstile widget 上方约 88px 处。
+     落在 Turnstile widget 上方 80~140px 处。
+  3. 一个解析不了的节点让 mihomo 丢弃整份 196 节点的订阅。
 
 不需要浏览器/网络: seleniumbase 在本地通常没装，import 前先塞个假模块。
 """
@@ -16,6 +17,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 sys.modules.setdefault("seleniumbase", types.SimpleNamespace(SB=object))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,11 +25,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import renew  # noqa: E402
 
 
+def patch_renew(testcase, **attrs):
+    """把 renew 模块里的若干属性替换掉，测试结束自动还原"""
+    for name, value in attrs.items():
+        p = mock.patch.object(renew, name, value)
+        p.start()
+        testcase.addCleanup(p.stop)
+
+
 class TestFilterProxyNodes(unittest.TestCase):
     """代理组里的占位节点必须被排除"""
 
     def test_drops_compatible_placeholder(self):
-        # provider 加载失败(503)时，代理组里只剩 mihomo 的 COMPATIBLE 占位符，
+        # provider 加载失败时，代理组里只剩 mihomo 的 COMPATIBLE 占位符，
         # 它的行为等同 DIRECT。当成真实节点用 = 无代理直连。
         self.assertEqual(renew._filter_proxy_nodes(["COMPATIBLE"]), [])
 
@@ -58,8 +68,9 @@ class TestScreenOffset(unittest.TestCase):
                          (0, 88))
 
     def test_adds_window_position(self):
-        self.assertEqual(renew._screen_offset({"sx": 12, "sy": 30, "oh": 900, "ih": 812}),
-                         (12, 118))
+        # CI 实测就是这一档: 窗口在 (20,20)，工具栏 121px
+        self.assertEqual(renew._screen_offset({"sx": 20, "sy": 20, "oh": 900, "ih": 779}),
+                         (20, 141))
 
     def test_falls_back_when_wininfo_unavailable(self):
         # 取不到窗口信息时不能退化成 (0,0) —— 那正是原来的 bug
@@ -76,7 +87,7 @@ class TestScreenOffset(unittest.TestCase):
 class TestTurnstileClickPoint(unittest.TestCase):
     """用日志里的真实数值验证点击落点
 
-    实测容器: rect={'x': 486, 'y': 437, 'w': 308, 'h': 71}
+    实测容器: rect={'h': 71, 'w': 308, 'x': 486, 'y': 437}
     窗口 1280x900，工具栏 88px。
     """
 
@@ -107,6 +118,193 @@ class TestTurnstileClickPoint(unittest.TestCase):
         # 候选偏移必须把这个位置罩住（旧的 8~18px 全在它左边）
         self.assertTrue(any(18 <= dx <= 32 for dx in renew._TS_CHECKBOX_X_OFFSETS),
                         f"候选偏移 {renew._TS_CHECKBOX_X_OFFSETS} 没覆盖实测的 ~21px")
+
+
+class FakeSubprocess:
+    """够用的 subprocess 替身，把 xdotool 的目标坐标记下来
+
+    _xdotool_click 内部自己做视口→屏幕换算，所以测试必须打在它**下面**
+    这一层，否则换算逻辑会被 mock 掉，等于没测。
+    """
+
+    DEVNULL = -3
+
+    def __init__(self, on_click):
+        self.on_click = on_click
+        self.target = None
+
+    def run(self, args, **kwargs):
+        if args[:2] == ["xdotool", "mousemove"]:
+            self.target = (int(args[-2]), int(args[-1]))
+        elif args[:2] == ["xdotool", "click"] and self.target:
+            self.on_click(*self.target)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+class FakeClock:
+    """虚拟时钟: 让等待循环瞬间跑完且结果确定"""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def strftime(self, *args):
+        return "00:00:00"
+
+
+class FakeBrowser:
+    """够用的 sb 替身。
+
+    刻意不提供 uc_gui_click_cf / uc_gui_click_captcha:
+    handle_turnstile 若还在调它们，这里会直接 AttributeError。
+    """
+
+    def __init__(self):
+        self.reloads = 0
+
+    def get_current_url(self):
+        return "https://dashboard.katabump.com/auth/login"
+
+    def uc_open_with_reconnect(self, url, reconnect_time=None):
+        self.reloads += 1
+
+
+class TurnstileHarness:
+    """模拟一个「只有点在 checkbox 上才会通过」的 Turnstile
+
+    数值取自实际失败日志: 容器 rect x=486 y=437 w=308 h=71，窗口 1280x900。
+    """
+
+    BOX = {"x": 486, "y": 437, "w": 308, "h": 71, "vw": 1280, "vh": 900}
+    WININFO = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
+    # checkbox 在屏幕坐标系里的真实范围（已含 88px 工具栏偏移）
+    CHECKBOX = {"x1": 499, "y1": 550, "x2": 515, "y2": 570}
+
+    def __init__(self, auto_pass=False, solvable=True):
+        self.token = "x" * 40 if auto_pass else ""
+        self.solvable = solvable
+        self.clicks = []
+        self.resets = 0
+
+    def js(self, sb, expression):
+        expr = expression.strip()
+        if expr == renew._TS_BOX_JS.strip():
+            return dict(self.BOX)
+        if expr == renew._SOLVED_JS.strip():
+            return len(self.token) > 20
+        if expr == renew._TOKEN_LEN_JS.strip():
+            return len(self.token)
+        if expr == renew._WININFO_JS.strip():
+            return dict(self.WININFO)
+        if "turnstile.reset" in expr:
+            self.resets += 1
+            self.token = ""
+            return "reset"
+        if expr == renew._TS_DIAG_JS.strip():
+            return {"title": "Log in", "has_container": True, "token_len": 0}
+        raise AssertionError(f"未预期的 JS 调用: {expr[:60]}")
+
+    def click(self, x, y):
+        """收到的是屏幕坐标 —— 由 _xdotool_click 真实换算得出"""
+        self.clicks.append((x, y))
+        cb = self.CHECKBOX
+        if self.solvable and cb["x1"] <= x <= cb["x2"] and cb["y1"] <= y <= cb["y2"]:
+            self.token = "y" * 40
+
+    def hit_checkbox(self):
+        cb = self.CHECKBOX
+        return [(x, y) for x, y in self.clicks
+                if cb["x1"] <= x <= cb["x2"] and cb["y1"] <= y <= cb["y2"]]
+
+
+class TestHandleTurnstile(unittest.TestCase):
+    """handle_turnstile 端到端（无浏览器），含真实的坐标换算"""
+
+    def _run(self, harness):
+        sb = FakeBrowser()
+        patch_renew(
+            self,
+            _js=harness.js,
+            _ensure_connected=lambda sb: None,
+            _save_artifacts=lambda sb, tag: None,
+            _activate_window=lambda: None,
+            subprocess=FakeSubprocess(harness.click),
+            time=FakeClock(),
+        )
+        return renew.handle_turnstile(sb), sb
+
+    def test_clicks_land_on_checkbox_and_pass(self):
+        harness = TurnstileHarness()
+        ok, _ = self._run(harness)
+        self.assertTrue(ok, "点击落点正确时应当通过")
+        self.assertTrue(harness.hit_checkbox(),
+                        f"没有一次点击命中 checkbox，落点: {harness.clicks}")
+
+    def test_first_click_is_already_correct(self):
+        """第一次就该命中，不该靠后面的偏移候选去凑"""
+        harness = TurnstileHarness()
+        self._run(harness)
+        self.assertEqual(len(harness.clicks), 1,
+                         f"第一次点击就该成功，实际点了 {len(harness.clicks)} 次")
+
+    def test_auto_pass_skips_clicking(self):
+        harness = TurnstileHarness(auto_pass=True)
+        ok, _ = self._run(harness)
+        self.assertTrue(ok)
+        self.assertEqual(harness.clicks, [], "已自动通过时不该再点")
+
+    def test_gives_up_after_two_rounds(self):
+        harness = TurnstileHarness(solvable=False)
+        ok, sb = self._run(harness)
+        self.assertFalse(ok)
+        # 2 轮 × 4 个候选偏移，中间重载 1 次
+        self.assertEqual(len(harness.clicks), 8)
+        self.assertEqual(sb.reloads, 1)
+
+    def test_no_reset_after_final_attempt_of_a_round(self):
+        """每轮最后一次点击后紧接着重载/收摊，不必再 reset"""
+        harness = TurnstileHarness(solvable=False)
+        self._run(harness)
+        # 每轮 4 次点击只在前 3 次后 reset → 2 轮共 6 次
+        self.assertEqual(harness.resets, 6)
+
+
+class TestXdotoolClickConvertsCoordinates(unittest.TestCase):
+    """_xdotool_click 必须自己完成视口→屏幕换算
+
+    这是防止 bug 复发的关键一层: 换算放在唯一的 OS 边界里，
+    任何新调用点都不可能忘记加偏移。
+    """
+
+    WININFO = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
+
+    def _click(self, wininfo, vx, vy):
+        got = []
+        harness = types.SimpleNamespace(
+            js=lambda sb, expr: dict(wininfo) if wininfo else None)
+        patch_renew(
+            self,
+            _js=harness.js,
+            _activate_window=lambda: None,
+            subprocess=FakeSubprocess(lambda x, y: got.append((x, y))),
+            time=FakeClock(),
+        )
+        renew._xdotool_click(object(), vx, vy)
+        return got
+
+    def test_adds_toolbar_offset(self):
+        self.assertEqual(self._click(self.WININFO, 507, 472), [(507, 560)])
+
+    def test_uses_fallback_when_wininfo_missing(self):
+        # 读不到窗口信息也不能退化成零偏移
+        (x, y), = self._click(None, 507, 472)
+        self.assertEqual(x, 507)
+        self.assertGreater(y, 472, "没有窗口信息时也必须加上兜底的工具栏偏移")
 
 
 class FakeMihomo:
@@ -143,12 +341,8 @@ class TestPruneBadProxies(unittest.TestCase):
         return [{"name": f"n{i}", "type": "ss", "password": f"secret{i}"} for i in range(n)]
 
     def _run(self, fake, proxies, **kw):
-        saved = (renew._write_sub_file, renew._refresh_provider)
-        renew._write_sub_file, renew._refresh_provider = fake.write, fake.refresh
-        try:
-            return renew._prune_bad_proxies(proxies, **kw)
-        finally:
-            renew._write_sub_file, renew._refresh_provider = saved
+        patch_renew(self, _write_sub_file=fake.write, _refresh_provider=fake.refresh)
+        return renew._prune_bad_proxies(proxies, **kw)
 
     def test_no_bad_nodes_drops_nothing(self):
         fake = FakeMihomo()
@@ -232,8 +426,9 @@ class TestRedaction(unittest.TestCase):
         self._saved = set(renew._SECRETS)
         renew._SECRETS.clear()
         renew._register_secret(self.SUB)
+        self.addCleanup(self._restore)
 
-    def tearDown(self):
+    def _restore(self):
         renew._SECRETS.clear()
         renew._SECRETS.update(self._saved)
 
@@ -272,136 +467,101 @@ class TestRedaction(unittest.TestCase):
         renew._register_secret("abc")          # 太短，登记会被忽略
         self.assertEqual(renew._redact("abc def"), "abc def")
 
-
-class FakeClock:
-    """虚拟时钟: 让 handle_turnstile 的等待循环瞬间跑完且结果确定"""
-
-    def __init__(self):
-        self.now = 1000.0
-
-    def time(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.now += seconds
-
-    def strftime(self, *args):
-        return "00:00:00"
+    def test_mihomo_log_redacts_by_default(self):
+        """抹除必须在 _mihomo_log 这个漏斗里做，不能靠调用点自觉"""
+        printed = []
+        patch_renew(self, MIHOMO_LOG="/dev/null")
+        with mock.patch("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            renew._mihomo_log(f"fetch {self.SUB} failed")
+        self.assertNotIn("secretvalue123", printed[0])
+        self.assertIn("***", printed[0])
 
 
-class FakeBrowser:
-    """够用的 sb 替身。
+class TestPoll(unittest.TestCase):
+    """_poll: 统一的「等条件成立」循环"""
 
-    刻意不提供 uc_gui_click_cf / uc_gui_click_captcha:
-    handle_turnstile 若还在调它们，这里会直接 AttributeError。
-    """
+    def test_returns_first_truthy_result(self):
+        patch_renew(self, time=FakeClock())
+        seq = iter([None, None, "ok"])
+        self.assertEqual(renew._poll(lambda: next(seq), 10), "ok")
 
-    def __init__(self):
-        self.reloads = 0
+    def test_returns_none_on_timeout(self):
+        patch_renew(self, time=FakeClock())
+        self.assertIsNone(renew._poll(lambda: None, 3))
 
-    def get_current_url(self):
-        return "https://dashboard.katabump.com/auth/login"
+    def test_treats_exception_as_not_ready(self):
+        patch_renew(self, time=FakeClock())
+        calls = []
 
-    def uc_open_with_reconnect(self, url, reconnect_time=None):
-        self.reloads += 1
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("boom")
+            return "ok"
 
+        self.assertEqual(renew._poll(flaky, 10), "ok")
 
-class TurnstileHarness:
-    """模拟一个「只有点在 checkbox 上才会通过」的 Turnstile
-
-    数值取自实际失败日志: 容器 rect x=486 y=437 w=308 h=71，窗口 1280x900。
-    """
-
-    BOX = {"x": 486, "y": 437, "w": 308, "h": 71, "vw": 1280, "vh": 900}
-    WININFO = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
-    # checkbox 在屏幕坐标系里的真实范围（已含 88px 工具栏偏移）
-    CHECKBOX = {"x1": 499, "y1": 550, "x2": 515, "y2": 570}
-
-    def __init__(self, auto_pass=False, solvable=True):
-        self.token = "x" * 40 if auto_pass else ""
-        self.solvable = solvable
-        self.clicks = []
-        self.resets = 0
-
-    def js(self, sb, expression):
-        expr = expression.strip()
-        if expr == renew._TS_BOX_JS.strip():
-            return dict(self.BOX)
-        if expr == renew._SOLVED_JS.strip():
-            return len(self.token) > 20
-        if expr == renew._TOKEN_LEN_JS.strip():
-            return len(self.token)
-        if expr == renew._WININFO_JS.strip():
-            return dict(self.WININFO)
-        if "turnstile.reset" in expr:
-            self.resets += 1
-            self.token = ""
-            return "reset"
-        if expr == renew._TS_DIAG_JS.strip():
-            return {"title": "Log in", "has_container": True, "token_len": 0}
-        raise AssertionError(f"未预期的 JS 调用: {expr[:60]}")
-
-    def click(self, x, y):
-        self.clicks.append((x, y))
-        cb = self.CHECKBOX
-        if self.solvable and cb["x1"] <= x <= cb["x2"] and cb["y1"] <= y <= cb["y2"]:
-            self.token = "y" * 40
-
-    def hit_checkbox(self):
-        cb = self.CHECKBOX
-        return [(x, y) for x, y in self.clicks
-                if cb["x1"] <= x <= cb["x2"] and cb["y1"] <= y <= cb["y2"]]
+    def test_checks_condition_at_least_once(self):
+        patch_renew(self, time=FakeClock())
+        self.assertEqual(renew._poll(lambda: "ok", 0), "ok")
 
 
-class TestHandleTurnstile(unittest.TestCase):
-    """handle_turnstile 端到端（无浏览器）"""
+class TestLoadMihomoNodes(unittest.TestCase):
+    """取节点: 轮询等加载结果，且只打一条日志"""
 
-    def _run(self, harness):
-        clock = FakeClock()
-        sb = FakeBrowser()
-        patches = {
-            "_js": harness.js,
-            "_xdotool_click": harness.click,
-            "_ensure_connected": lambda sb: None,
-            "_save_artifacts": lambda sb, tag: None,
-            "time": clock,
-        }
-        saved = {k: getattr(renew, k) for k in patches}
-        for k, v in patches.items():
-            setattr(renew, k, v)
-        try:
-            return renew.handle_turnstile(sb), sb
-        finally:
-            for k, v in saved.items():
-                setattr(renew, k, v)
+    def _run(self, reads, timeout=5):
+        """reads: 每次 get_mihomo_proxies() 的返回值（或要抛的异常）"""
+        logs = []
+        seq = iter(reads)
 
-    def test_clicks_land_on_checkbox_and_pass(self):
-        harness = TurnstileHarness()
-        ok, _ = self._run(harness)
-        self.assertTrue(ok, "点击落点正确时应当通过")
-        self.assertTrue(harness.hit_checkbox(),
-                        f"没有一次点击命中 checkbox，落点: {harness.clicks}")
+        def fake_get():
+            v = next(seq)
+            if isinstance(v, Exception):
+                raise v
+            return v
 
-    def test_first_click_is_already_correct(self):
-        """第一次就该命中，不该靠后面的偏移候选去凑"""
-        harness = TurnstileHarness()
-        self._run(harness)
-        self.assertEqual(len(harness.clicks), 1,
-                         f"第一次点击就该成功，实际点了 {len(harness.clicks)} 次")
+        patch_renew(self, time=FakeClock(), get_mihomo_proxies=fake_get,
+                    _mihomo_log=logs.append)
+        return renew.load_mihomo_nodes(timeout), logs
 
-    def test_auto_pass_skips_clicking(self):
-        harness = TurnstileHarness(auto_pass=True)
-        ok, _ = self._run(harness)
-        self.assertTrue(ok)
-        self.assertEqual(harness.clicks, [], "已自动通过时不该再点")
+    def test_returns_nodes_once_available(self):
+        nodes, logs = self._run([(["香港01", "日本02"], [])])
+        self.assertEqual(nodes, ["香港01", "日本02"])
+        self.assertEqual(len(logs), 1, f"应只打一条日志，实际: {logs}")
+        self.assertIn("2 个候选节点", logs[0])
 
-    def test_gives_up_after_two_rounds(self):
-        harness = TurnstileHarness(solvable=False)
-        ok, sb = self._run(harness)
-        self.assertFalse(ok)
-        # 2 轮 × 4 次点击，中间重载 1 次
-        self.assertEqual(len(harness.clicks), 8)
-        self.assertEqual(sb.reloads, 1)
+    def test_waits_for_slow_load(self):
+        # 前两次代理组还只有占位符，第三次才出真实节点
+        nodes, _ = self._run([([], ["COMPATIBLE"]),
+                              ([], ["COMPATIBLE"]),
+                              (["香港01"], [])])
+        self.assertEqual(nodes, ["香港01"])
+
+    def test_reports_placeholders_when_nothing_real(self):
+        nodes, logs = self._run([([], ["COMPATIBLE"])] * 10)
+        self.assertEqual(nodes, [])
+        # 不管轮询多少次，日志只在最后打一条
+        self.assertEqual(len(logs), 1, f"应只打一条日志，实际: {logs}")
+        self.assertIn("COMPATIBLE", logs[0])
+
+    def test_survives_api_errors(self):
+        nodes, logs = self._run([RuntimeError("connection refused")] * 10)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any("失败" in m for m in logs))
+
+
+class TestVersionConstants(unittest.TestCase):
+    """版本号/provider 名只能有一个来源"""
+
+    def test_sub_ua_derives_from_version(self):
+        self.assertIn(renew.MIHOMO_VERSION, renew._SUB_UA)
+
+    def test_sub_file_derives_from_provider_name(self):
+        self.assertTrue(
+            os.path.basename(renew.MIHOMO_SUB_FILE).startswith(renew.MIHOMO_PROVIDER))
+
+    def test_provider_api_uses_provider_name(self):
+        self.assertTrue(renew.MIHOMO_PROVIDER_API.endswith(renew.MIHOMO_PROVIDER))
 
 
 if __name__ == "__main__":

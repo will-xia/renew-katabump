@@ -8,6 +8,7 @@ import time
 import subprocess
 import json
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs
 import requests
 import yaml
@@ -20,24 +21,58 @@ class RenewError(Exception):
     「未到续期时间」不属于错误，走 skip 状态，不抛这个异常。
     """
 
+
+#  失败证据留档（workflow 只上传 output/ 目录，写到别处等于丢弃）
+OUTPUT_DIR = os.path.join(os.getcwd(), "output")
+ARTIFACT_DIR = os.path.join(OUTPUT_DIR, "screenshots")
+
+
+def _poll(fn, seconds: float, interval: float = 0.5):
+    """反复调用 fn 直到返回真值，超时返回 None
+
+    全文有好几处「等某个条件成立」的循环，统一走这里，省得每处
+    各写一遍 sleep 间隔和超时判断。fn 抛异常视为「还没成立」。
+    """
+    deadline = time.time() + seconds
+    while True:
+        try:
+            result = fn()
+            if result:
+                return result
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return None
+        time.sleep(interval)
+
 # ==========================================
 # ========== Mihomo 代理池模块 ==============
 # ==========================================
+# 版本号只写一处: 下载 URL 和拉订阅用的 UA 都从这里派生，
+# 否则升级 mihomo 时漏改一处，UA 就会和实际版本对不上。
+MIHOMO_VERSION = "v1.19.29"
 MIHOMO_PATH = os.path.join(os.getcwd(), "mihomo")
 MIHOMO_CONFIG = os.path.join(os.getcwd(), "config.yaml")
 MIHOMO_LOG = os.path.join(os.getcwd(), "mihomo.log")
 MIHOMO_CONTROLLER = "http://127.0.0.1:9090"
 MIHOMO_MIXED_PORT = 7890
 MIHOMO_GROUP = "MyGroup"
-MIHOMO_SUB_FILE = os.path.join(os.getcwd(), "sub1.yaml")
+# provider 名字同时用在配置里、proxy-groups.use 里和控制 API 的 URL 里，
+# 文件名也由它派生，三处必须一致，所以只留一个来源。
+MIHOMO_PROVIDER = "sub1"
+MIHOMO_SUB_FILE = os.path.join(os.getcwd(), f"{MIHOMO_PROVIDER}.yaml")
+MIHOMO_PROVIDER_API = f"{MIHOMO_CONTROLLER}/providers/proxies/{MIHOMO_PROVIDER}"
+
+# 拉订阅用 clash 系 UA: 部分机场只对这类 UA 返回 Clash 格式
+_SUB_UA = f"mihomo/{MIHOMO_VERSION}"
 
 _mihomo_proc = None   # 用于退出时清理
-_sub_proxies = []     # 订阅里的节点列表，坏节点会被逐个剔除
 
 
 # 需要从任何输出里抹掉的凭据。SUB_URL 本身就是凭据，而 mihomo 以
-# log-level: debug 运行时会把订阅 URL 打进自己的日志，所以任何要进
-# CI 日志或 artifact 的文本都得先过一遍 _redact()。
+# log-level: debug 运行时会把订阅 URL 打进自己的日志。
+# 抹除统一在 _mihomo_log() 里做，不依赖每个调用点自觉 —— 靠自觉的
+# 版本已经漏过两处（原来那两个直接 dump mihomo.log 的地方）。
 _SECRETS: set = set()
 
 
@@ -76,6 +111,13 @@ def _redact(text) -> str:
 
 
 def _mihomo_log(msg):
+    """打印一条 mihomo 相关日志。
+
+    抹除凭据放在这个漏斗里，而不是散在各个调用点: 所有要进 CI 日志的
+    mihomo 消息都要经过这里，在这里保证一次，就不会有哪个新增的诊断
+    忘了包 _redact() 而把订阅链接漏进公开日志。_redact 是幂等的。
+    """
+    msg = _redact(msg)
     print(f"[Mihomo] {msg}")
     try:
         with open(MIHOMO_LOG, "a") as f:
@@ -85,19 +127,28 @@ def _mihomo_log(msg):
 
 
 def setup_mihomo(sub_url: str) -> bool:
-    """下载 Mihomo 二进制、生成配置、启动代理引擎"""
+    """下载 Mihomo、生成配置、启动，并装好一份**能被加载**的节点集
+
+    返回 True 即保证 mihomo 已经成功加载了订阅（坏节点已剔除）。
+    剔除放在这里而不是留给调用方，是为了让「setup 成功」这件事本身
+    就意味着节点可用 —— 否则谁跳过剔除直接读节点，就会撞回原来的坑。
+    """
     global _mihomo_proc
 
     if not sub_url:
         return False
 
-    _mihomo_log(f"检测到 SUB_URL，准备启动代理池...")
+    # 订阅链接是凭据，在拿到它的同一处登记，之后所有日志自动抹除。
+    # 放在这里而不是 main，是为了让「持有」和「登记」是同一个动作。
+    _register_secret(sub_url)
+    _mihomo_log("检测到 SUB_URL，准备启动代理池...")
 
     # 1. 下载二进制（若不存在）
     if not os.path.exists(MIHOMO_PATH):
-        _mihomo_log("下载 mihomo-linux-amd64...")
+        _mihomo_log(f"下载 mihomo-linux-amd64 {MIHOMO_VERSION}...")
         try:
-            url = "https://github.com/MetaCubeX/mihomo/releases/download/v1.18.9/mihomo-linux-amd64-v1.18.9.gz"
+            url = (f"https://github.com/MetaCubeX/mihomo/releases/download/"
+                   f"{MIHOMO_VERSION}/mihomo-linux-amd64-{MIHOMO_VERSION}.gz")
             subprocess.run(["curl", "-L", "-o", "mihomo.gz", url], check=True, timeout=120)
             subprocess.run(["gzip", "-d", "mihomo.gz"], check=True)
             subprocess.run(["chmod", "+x", MIHOMO_PATH], check=True)
@@ -118,12 +169,11 @@ def setup_mihomo(sub_url: str) -> bool:
     # 2. 先自己把订阅拉下来写成本地文件，再让 mihomo 读这个文件。
     #    不让它直连订阅 URL，是因为它遇到一个解析不了的节点就整份作废，
     #    而本地文件模式下我们可以把坏节点剔掉再喂给它。
-    global _sub_proxies
     try:
-        _sub_proxies = fetch_subscription(sub_url)
-        _write_sub_file(_sub_proxies)
+        proxies = fetch_subscription(sub_url)
+        _write_sub_file(proxies)
     except Exception as e:
-        _mihomo_log(f"订阅下载/解析失败: {_redact(e)}")
+        _mihomo_log(f"订阅下载/解析失败: {e}")
         return False
 
     # 3. 生成配置（不再包含订阅链接，配置本身也就不含凭据了）
@@ -134,9 +184,9 @@ mode: rule
 log-level: debug
 external-controller: 127.0.0.1:9090
 proxy-providers:
-  sub1:
+  {MIHOMO_PROVIDER}:
     type: file
-    path: ./sub1.yaml
+    path: ./{os.path.basename(MIHOMO_SUB_FILE)}
     health-check:
       enable: true
       interval: 600
@@ -145,7 +195,7 @@ proxy-groups:
   - name: {MIHOMO_GROUP}
     type: select
     use:
-      - sub1
+      - {MIHOMO_PROVIDER}
 rules:
   - MATCH,{MIHOMO_GROUP}
 """
@@ -191,11 +241,7 @@ rules:
         # 检查进程是否还活着
         if _mihomo_proc and _mihomo_proc.poll() is not None:
             _mihomo_log(f"⚠️ Mihomo 进程已退出 (code={_mihomo_proc.returncode})")
-            try:
-                with open(MIHOMO_LOG) as f:
-                    _mihomo_log(f"日志内容:\n{f.read()[:2000]}")
-            except Exception:
-                pass
+            _log_mihomo_tail()
             return False
         try:
             r = requests.get(f"{MIHOMO_CONTROLLER}/version", timeout=2)
@@ -208,28 +254,30 @@ rules:
 
     if not mihomo_ready:
         _mihomo_log("⚠️ Mihomo 15 秒内未就绪，打印日志:")
-        try:
-            with open(MIHOMO_LOG) as f:
-                _mihomo_log(f"日志内容:\n{f.read()[:2000]}")
-        except Exception:
-            pass
+        _log_mihomo_tail()
         # 仍然尝试继续（可能 API 延迟绑定）
 
-    # 7. 多等几秒确保完全就绪；provider 刷新交给 load_mihomo_nodes()，
-    #    那里带退避重试，避免订阅偶发 503 就静默退化成直连。
-    if mihomo_ready:
-        time.sleep(3)
-
-    return True
+    # 7. 让 mihomo 真正加载这份订阅，顺手剔掉它解析不了的节点。
+    #    必须在进程起来之后做 —— 校验器就是 mihomo 自己。
+    before = len(proxies)
+    kept, dropped = _prune_bad_proxies(proxies)
+    if dropped:
+        _mihomo_log(f"共剔除 {len(dropped)} 个无法解析的节点，"
+                    f"{before} → {len(kept)} 个可用")
+    if not kept:
+        _mihomo_log(f"⚠️ 订阅里 {before} 个节点 mihomo 全都解析不了，无可用节点")
+    return bool(kept)
 
 
 # Mihomo 内置的占位/特殊节点，一个都不能当成真实代理。
 #
-# 其中 COMPATIBLE 是最坑的一个: provider 拉取失败时（比如订阅返回 503），
-# 代理组不会变空，而是只剩这一个占位符，它的行为**等同 DIRECT**。
+# 其中 COMPATIBLE 是最坑的一个: provider 加载失败时代理组不会变空，
+# 而是只剩这一个占位符，它的行为**等同 DIRECT**。
 # 早先只过滤 DIRECT/REJECT，于是 COMPATIBLE 一路混过测速（走直连当然通），
 # 日志显示「可用节点: 1」，实际流量从 runner 自己的 Azure 数据中心 IP 出去，
 # Turnstile 对着数据中心 IP 只会给最硬的那档验证，必然卡死。
+# 现在订阅由我们自己下载、坏节点会被剔除，所以走到「只有 COMPATIBLE」
+# 基本只剩一种可能: sub1.yaml 里的节点 mihomo 全都不认。
 _PLACEHOLDER_NODES = frozenset({
     "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL",
 })
@@ -240,20 +288,16 @@ def _filter_proxy_nodes(all_nodes, group: str = MIHOMO_GROUP) -> list:
     return [n for n in all_nodes if n not in _PLACEHOLDER_NODES and n != group]
 
 
-def get_mihomo_proxies() -> list:
-    """从 Mihomo API 获取可用节点列表"""
-    try:
-        r = requests.get(f"{MIHOMO_CONTROLLER}/proxies/{MIHOMO_GROUP}", timeout=10)
-        data = r.json()
-        all_nodes = data.get("all", [])
-        filtered = _filter_proxy_nodes(all_nodes)
-        dropped = [n for n in all_nodes if n not in filtered]
-        _mihomo_log(f"获取到 {len(filtered)} 个候选节点"
-                    + (f"（已排除占位节点: {', '.join(dropped)}）" if dropped else ""))
-        return filtered
-    except Exception as e:
-        _mihomo_log(f"获取节点列表失败: {e}")
-        return []
+def get_mihomo_proxies() -> tuple:
+    """读代理组，返回 (真实节点, 被排除的占位节点)
+
+    刻意不在这里打日志: 它会被 _poll 反复调用，每次都打就是十来行重复。
+    日志留给 load_mihomo_nodes 在拿到最终结果后打一次。
+    """
+    r = requests.get(f"{MIHOMO_CONTROLLER}/proxies/{MIHOMO_GROUP}", timeout=10)
+    all_nodes = r.json().get("all", [])
+    return (_filter_proxy_nodes(all_nodes),
+            [n for n in all_nodes if n in _PLACEHOLDER_NODES or n == MIHOMO_GROUP])
 
 
 def _refresh_provider() -> tuple:
@@ -263,19 +307,16 @@ def _refresh_provider() -> tuple:
     "proxy 34 error: encoding/hex: invalid byte"），这是定位问题的唯一线索。
     """
     try:
-        r = requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=15)
+        r = requests.put(MIHOMO_PROVIDER_API, timeout=15)
         detail = ""
         if r.status_code >= 300:
-            detail = f" | mihomo 返回: {_redact(r.text[:300]).strip()}"
+            detail = f" | mihomo 返回: {r.text[:300].strip()}"
         _mihomo_log(f"刷新 provider: {r.status_code}{detail}")
         return r.status_code, r.text
     except Exception as e:
         _mihomo_log(f"刷新 provider 失败: {e}")
         return -1, str(e)
 
-
-# 拉订阅用 clash 系 UA: 部分机场只对这类 UA 返回 Clash 格式
-_SUB_UA = "mihomo/v1.18.9"
 
 # mihomo 只报坏节点的下标，不报名字，例如:
 #   {"message":"proxy 34 error: encoding/hex: invalid byte: U+0068 'h'"}
@@ -290,13 +331,27 @@ def fetch_subscription(sub_url: str) -> list:
     198 个好节点会因为 1 个坏节点全部作废（实测就是这么挂的）。
     """
     r = requests.get(sub_url, headers={"User-Agent": _SUB_UA}, timeout=30)
-    r.raise_for_status()
+
+    # 元信息在成功和失败时都要报，且只报可安全公开的部分:
+    # 链接本身是凭据，响应体里是节点密码，都不能进日志。
+    # subscription-userinfo 是关键 —— 流量耗尽/套餐过期会直接体现在这里。
+    meta = (f"HTTP {r.status_code}, {len(r.content)} 字节, "
+            f"content-type={r.headers.get('content-type', '?')}")
+    userinfo = r.headers.get("subscription-userinfo")
+    if userinfo:
+        meta += f", subscription-userinfo={userinfo}"
+    _mihomo_log(f"订阅响应: {meta}")
+
+    if r.status_code >= 400:
+        # 错误响应通常是短 JSON/文本提示，不含节点凭据
+        raise RuntimeError(f"订阅返回 {r.status_code}: {r.text[:200].strip()!r}")
+
     data = yaml.safe_load(r.content)
     if not isinstance(data, dict) or not isinstance(data.get("proxies"), list):
         raise ValueError("订阅不是 Clash/mihomo YAML 格式（找不到 proxies 列表），"
                          "可能是 base64 的 V2Ray 订阅")
     proxies = data["proxies"]
-    _mihomo_log(f"订阅下载成功: {len(r.content)} 字节, {len(proxies)} 个节点")
+    _mihomo_log(f"订阅解析成功: {len(proxies)} 个节点")
     return proxies
 
 
@@ -351,8 +406,7 @@ def _prune_bad_proxies(proxies: list, max_drops: int = 25) -> tuple:
 def _log_provider_info():
     """打印 mihomo 侧的 provider 状态（节点数 / 上次更新时间）"""
     try:
-        r = requests.get(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=10)
-        d = r.json()
+        d = requests.get(MIHOMO_PROVIDER_API, timeout=10).json()
         _mihomo_log(f"provider 状态: vehicleType={d.get('vehicleType')}, "
                     f"updatedAt={d.get('updatedAt')}, "
                     f"节点数={len(d.get('proxies') or [])}")
@@ -360,115 +414,98 @@ def _log_provider_info():
         _mihomo_log(f"读取 provider 状态失败: {e}")
 
 
-# 探测用的 UA。不少机场只在 UA 里含 clash/mihomo 时才返回 Clash 格式配置，
-# 否则给 4xx/5xx —— 一次性把三种都试掉，直接看出是不是 UA 的问题。
-_SUB_PROBE_UAS = (
-    ("配置当前使用的 UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
-    ("mihomo UA", "mihomo/v1.18.9"),
-    ("clash UA", "ClashforWindows/0.19.23"),
-)
+def _mihomo_log_tail(lines: int = 80) -> str:
+    """读 mihomo 日志尾部（凭据由 _mihomo_log / 写出口统一抹除）"""
+    try:
+        with open(MIHOMO_LOG, errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except Exception as e:
+        return f"(读取 {MIHOMO_LOG} 失败: {e})"
 
 
-def _probe_sub_url(sub_url: str):
-    """直接拉一次订阅，只报可安全公开的元信息。
-
-    刻意不打印链接和响应体正文: 链接本身是凭据，正文里是节点密码。
-    只输出状态码、长度、content-type、以及「像不像 Clash 配置」的判断。
-    subscription-userinfo 响应头是关键 —— 流量用尽或套餐过期会直接体现在这里。
-    """
-    if not sub_url:
-        return
-    _mihomo_log("订阅可达性探测（不打印链接与响应体正文）:")
-    for label, ua in _SUB_PROBE_UAS:
-        try:
-            r = requests.get(sub_url, headers={"User-Agent": ua}, timeout=20)
-            body = r.content or b""
-            text = body[:4096].decode("utf-8", "replace")
-            info = (f"HTTP {r.status_code}, {len(body)} 字节, "
-                    f"content-type={r.headers.get('content-type', '?')}, "
-                    f"含 proxies 段={'proxies:' in text}, "
-                    f"'- name:' 出现 {body.count(b'- name:')} 次")
-            userinfo = r.headers.get("subscription-userinfo")
-            if userinfo:
-                info += f", subscription-userinfo={userinfo}"
-            _mihomo_log(f"  [{label}] {info}")
-            # 错误响应一般是短 JSON/文本提示，不含节点凭据，抹掉链接后可安全打印
-            if r.status_code >= 400 and len(body) < 2000:
-                _mihomo_log(f"  [{label}] 错误正文: {_redact(text[:200]).strip()!r}")
-        except Exception as e:
-            _mihomo_log(f"  [{label}] 请求异常: {type(e).__name__}: {_redact(e)}")
+def _log_mihomo_tail(lines: int = 40):
+    """把 mihomo 日志尾部打进 CI 日志"""
+    _mihomo_log(f"日志尾部:\n{_mihomo_log_tail(lines)}")
 
 
 def _export_mihomo_log(lines: int = 80):
     """把 mihomo 日志尾部抹掉凭据后落进 output/，供 CI artifact 上传"""
     try:
-        with open(MIHOMO_LOG, errors="replace") as f:
-            tail = f.readlines()[-lines:]
-        os.makedirs(ARTIFACT_DIR, exist_ok=True)
-        dest = os.path.join(os.path.dirname(ARTIFACT_DIR), "mihomo.log")
-        with open(dest, "w") as f:
-            f.write(_redact("".join(tail)))
-        _mihomo_log(f"mihomo 日志尾部已导出: output/mihomo.log（已抹除凭据）")
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(os.path.join(OUTPUT_DIR, "mihomo.log"), "w") as f:
+            f.write(_redact(_mihomo_log_tail(lines)))
+        _mihomo_log("mihomo 日志尾部已导出: output/mihomo.log（已抹除凭据）")
     except Exception as e:
         _mihomo_log(f"导出 mihomo 日志失败: {e}")
 
 
-def _diagnose_subscription(sub_url: str):
-    """订阅拿不到节点时的完整诊断"""
-    _mihomo_log("=" * 20 + " 订阅诊断 " + "=" * 20)
+def _diagnose_subscription():
+    """代理组里没有真实节点时的诊断
+
+    不再回头重新探测订阅 URL: 能走到这里，说明 fetch_subscription 已经
+    成功下载并解析过（否则 setup_mihomo 就返回 False 了），所以订阅可达性、
+    格式、UA 都已经被证实没问题。剩下的唯一可能是 mihomo 不认这批节点，
+    答案在它自己的日志里。
+    """
+    _mihomo_log("=" * 20 + " 节点加载诊断 " + "=" * 20)
     _log_provider_info()
-    _probe_sub_url(sub_url)
+    _log_mihomo_tail()
     _export_mihomo_log()
     _mihomo_log("=" * 50)
 
 
-def load_mihomo_nodes(attempts: int = 4) -> list:
-    """让 mihomo 加载订阅并取出真实节点，失败带退避重试。
+def load_mihomo_nodes(timeout: int = 10) -> list:
+    """取出代理组里的真实节点，等 mihomo 把加载结果反映到 API 上。
 
-    判据只看「过滤后还剩几个真实节点」，不看刷新接口的返回码:
-    返回 204 也可能节点列表为空，返回 503 时上一次加载的节点又可能还在。
+    这里不再重试 provider 刷新: provider 现在是 type: file，重刷只会让
+    mihomo 重读我们刚写的同一份字节，结果不可能变；而坏节点已经在
+    setup_mihomo 里剔干净了。只需要轮询等 /proxies 跟上加载结果。
     """
-    global _sub_proxies
-    if _sub_proxies:
-        before = len(_sub_proxies)
-        _sub_proxies, dropped = _prune_bad_proxies(_sub_proxies)
-        if dropped:
-            _mihomo_log(f"共剔除 {len(dropped)} 个无法解析的节点，"
-                        f"{before} → {len(_sub_proxies)} 个可用")
+    seen = {"nodes": [], "placeholders": [], "error": None}
 
-    for i in range(attempts):
-        _refresh_provider()
-        time.sleep(3)
-        nodes = get_mihomo_proxies()
-        if nodes:
-            return nodes
-        if i < attempts - 1:
-            wait = 3 * (i + 1)
-            _mihomo_log(f"⚠️ 订阅内无真实节点，{wait}s 后重试 "
-                        f"({i + 2}/{attempts})")
-            time.sleep(wait)
-    return []
+    def ready() -> bool:
+        try:
+            seen["nodes"], seen["placeholders"] = get_mihomo_proxies()
+        except Exception as e:
+            seen["error"] = e
+            return False
+        return bool(seen["nodes"])
+
+    _poll(ready, timeout, interval=1.0)
+
+    if seen["error"] and not seen["nodes"]:
+        _mihomo_log(f"获取节点列表失败: {seen['error']}")
+    _mihomo_log(f"获取到 {len(seen['nodes'])} 个候选节点"
+                + (f"（已排除占位节点: {', '.join(seen['placeholders'])}）"
+                   if seen["placeholders"] else ""))
+    return seen["nodes"]
 
 
-def test_mihomo_proxies(proxy_names: list) -> list:
-    """并发测速，返回健康节点列表"""
-    _mihomo_log(f"开始对 {len(proxy_names)} 个节点测速...")
-    healthy = []
-    batch_size = 15
-    for i in range(0, len(proxy_names), batch_size):
-        batch = proxy_names[i:i + batch_size]
-        for name in batch:
-            try:
-                r = requests.get(
-                    f"{MIHOMO_CONTROLLER}/proxies/{requests.utils.quote(name, safe='')}/delay",
-                    params={"timeout": "3000", "url": "http://www.gstatic.com/generate_204"},
-                    timeout=5
-                )
-                data = r.json()
-                if data.get("delay"):
-                    healthy.append(name)
-            except Exception:
-                pass
+def _node_delay_ok(name: str) -> bool:
+    """单个节点测速，通了返回 True"""
+    try:
+        r = requests.get(
+            f"{MIHOMO_CONTROLLER}/proxies/{requests.utils.quote(name, safe='')}/delay",
+            params={"timeout": "3000", "url": "http://www.gstatic.com/generate_204"},
+            timeout=5
+        )
+        return bool(r.json().get("delay"))
+    except Exception:
+        return False
+
+
+def test_mihomo_proxies(proxy_names: list, workers: int = 20) -> list:
+    """并发测速，返回健康节点列表（保持入参顺序）
+
+    这里以前虽然写着「并发」，实际是串行的双层 for，batch_size 也没用上。
+    过去看不出问题是因为节点池里只有 COMPATIBLE 一个；现在是 ~195 个真实
+    节点，串行意味着每个不通的节点都要吃满 3s 超时，光测速就要 3~5 分钟。
+    探测目标是本地 mihomo 的控制接口，并发完全撑得住。
+    """
+    _mihomo_log(f"开始对 {len(proxy_names)} 个节点测速（并发 {workers}）...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = pool.map(_node_delay_ok, proxy_names)
+        healthy = [name for name, ok in zip(proxy_names, results) if ok]
     _mihomo_log(f"测速完成，健康节点: {len(healthy)}/{len(proxy_names)}")
     return healthy
 
@@ -808,9 +845,10 @@ def _activate_window():
 
 
 # 取不到窗口信息时的兜底值（窗口按 set_window_size(1280, 900) 算，
-# Linux 版 Chrome 的标签栏+地址栏合计约 88px）。宁可用估算值，
-# 也不能退化成零偏移 —— 那等于把视口坐标当屏幕坐标用。
-_WIN_FALLBACK = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
+# Linux 版 Chrome 的标签栏+地址栏合计约 88px；实测 CI 里是 141px，
+# 所以正常路径一定要读实测值，这里只是最后的保险）。
+# 宁可用估算值，也不能退化成零偏移 —— 那等于把视口坐标当屏幕坐标用。
+_WIN_FALLBACK = {"oh": 900, "ih": 812}
 
 
 def _screen_offset(wininfo) -> tuple:
@@ -818,7 +856,7 @@ def _screen_offset(wininfo) -> tuple:
 
     xdotool 收的是 X 屏幕坐标，而 getBoundingClientRect() 给的是视口坐标，
     两者相差「窗口左上角位置 + 浏览器工具栏高度」。漏掉这段偏移时，
-    点击会稳定落在目标上方 80~90px 处 —— 日志看起来一切正常，实际全打空。
+    点击会稳定落在目标上方 80~140px 处 —— 日志看起来一切正常，实际全打空。
     """
     if not wininfo or not wininfo.get("oh") or not wininfo.get("ih"):
         wininfo = _WIN_FALLBACK
@@ -832,17 +870,23 @@ def _to_screen_point(wininfo, vx, vy) -> tuple:
     return int(vx + dx), int(vy + dy)
 
 
-def _viewport_to_screen(sb, vx, vy) -> tuple:
-    """读一次窗口信息，把视口坐标换算成屏幕坐标"""
+def _xdotool_click(sb, vx, vy):
+    """在**视口坐标** (vx, vy) 处做一次 OS 级点击。
+
+    刻意收视口坐标而不是屏幕坐标: 全文所有坐标来源
+    （_TS_BOX_JS / _ALTCHA_EXPAND_JS / _altcha_checkbox_coords）给的都是
+    视口坐标，没有一处真正产出屏幕坐标。换算放在这个唯一的 OS 边界里，
+    调用方就不可能忘记 —— 之前换算靠调用方自觉，Turnstile 那条路径漏了，
+    六次点击全部打在 widget 上方，日志还打得像模像样。
+    """
     wininfo = None
     try:
         wininfo = _js(sb, _WININFO_JS)
     except Exception:
         pass
-    return _to_screen_point(wininfo, vx, vy)
+    x, y = _to_screen_point(wininfo, vx, vy)
+    print(f"   视口({vx:.0f},{vy:.0f}) → 屏幕({x},{y})")
 
-
-def _xdotool_click(x: int, y: int):
     _activate_window()
     try:
         subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=3, stderr=subprocess.DEVNULL)
@@ -860,8 +904,8 @@ def _xdotool_click(x: int, y: int):
 # 但宿主容器 <div class="cf-turnstile"> 本身在普通 DOM 里，位置/尺寸完全可读，
 # checkbox 固定在容器左侧（实测偏移约 21px，垂直居中），据此即可精确点击。
 #
-# 注意: 这里读到的是**视口坐标**，交给 xdotool 前必须过一遍
-# _viewport_to_screen() 换成屏幕坐标，否则点击会落在 widget 上方约 88px。
+# 这里读到的是**视口坐标**，直接交给 _xdotool_click 即可 ——
+# 换算成屏幕坐标由它内部统一负责。
 _TS_BOX_JS = """
 (function() {
     var c = document.querySelector('.cf-turnstile');
@@ -992,10 +1036,6 @@ def _altcha_checkbox_coords(sb):
         return None
 
 
-#  失败证据留档（workflow 只上传 output/ 目录，写到别处等于丢弃）
-ARTIFACT_DIR = os.path.join(os.getcwd(), "output", "screenshots")
-
-
 def _save_artifacts(sb, tag: str):
     """保存截图 + 页面 HTML 到 output/screenshots/，供 CI artifact 上传"""
     try:
@@ -1041,26 +1081,21 @@ def _turnstile_diagnostics(sb, tag: str):
 #  人机验证处理
 def _wait_turnstile_box(sb, seconds: int = 15):
     """等 widget 渲染出可见容器（api.js 是 async，容器有尺寸才说明渲染完成）"""
-    for i in range(seconds):
-        box = _turnstile_box(sb)
-        if box:
-            print(f"✅ 定位到 Turnstile widget: "
-                  f"({box['x']:.0f},{box['y']:.0f}) {box['w']:.0f}x{box['h']:.0f}（{i+1}s）")
-            return box
-        time.sleep(1)
-    print("⚠️ Turnstile widget 未渲染出可见容器")
-    return None
+    box = _poll(lambda: _turnstile_box(sb), seconds, interval=1.0)
+    if box:
+        print(f"✅ 定位到 Turnstile widget: "
+              f"({box['x']:.0f},{box['y']:.0f}) {box['w']:.0f}x{box['h']:.0f}")
+    else:
+        print("⚠️ Turnstile widget 未渲染出可见容器")
+    return box
 
 
 def _wait_turnstile_solved(sb, seconds: float, label: str) -> bool:
     """轮询 hidden input，拿到 token 即算通过"""
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        if _js(sb, _SOLVED_JS):
-            print(f"✅ Turnstile 已通过（{label}，token 长度 {_js(sb, _TOKEN_LEN_JS)}）")
-            return True
-        time.sleep(0.5)
-    return False
+    if not _poll(lambda: _js(sb, _SOLVED_JS), seconds):
+        return False
+    print(f"✅ Turnstile 已通过（{label}，token 长度 {_js(sb, _TOKEN_LEN_JS)}）")
+    return True
 
 
 def _reset_turnstile(sb):
@@ -1103,23 +1138,22 @@ def handle_turnstile(sb) -> bool:
         if not box:
             continue
 
-        for attempt in range(4):
-            dx = _TS_CHECKBOX_X_OFFSETS[attempt % len(_TS_CHECKBOX_X_OFFSETS)]
-            vx = box["x"] + dx
-            vy = box["y"] + box["h"] / 2
-            sx, sy = _viewport_to_screen(sb, vx, vy)
-            print(f"🖱️ xdotool 点击 视口({vx:.0f},{vy:.0f}) → 屏幕({sx},{sy})，"
+        last_attempt = len(_TS_CHECKBOX_X_OFFSETS) - 1
+        for attempt, dx in enumerate(_TS_CHECKBOX_X_OFFSETS):
+            print(f"🖱️ xdotool 点击 Turnstile checkbox，"
                   f"容器左偏移 {dx}px [尝试 {attempt + 1}]")
-            _xdotool_click(sx, sy)
+            _xdotool_click(sb, box["x"] + dx, box["y"] + box["h"] / 2)
             # 模拟人类操作：点击后短暂停顿，让浏览器处理事件
             time.sleep(0.5 + (time.time() % 1) * 0.3)
 
             if _wait_turnstile_solved(sb, 15, "xdotool 点击"):
                 return True
 
-            print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
-            _reset_turnstile(sb)
-            box = _turnstile_box(sb) or box
+            # 最后一次就不用再 reset 了 —— 紧接着要么重载页面，要么收摊
+            if attempt < last_attempt:
+                print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
+                _reset_turnstile(sb)
+                box = _turnstile_box(sb) or box
 
     _turnstile_diagnostics(sb, "turnstile_fail")
     return False
@@ -1388,9 +1422,8 @@ def _solve_altcha(sb) -> bool:
             """)
         # 策略 B: xdotool 物理点击 iframe 坐标
         elif coords:
-            ax, ay = _viewport_to_screen(sb, coords["cx"], coords["cy"])
-            print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
-            _xdotool_click(ax, ay)
+            print("🖱️  ALTCHA点击复选框")
+            _xdotool_click(sb, coords["cx"], coords["cy"])
 
         # 策略 C: JS 遍历模态框内所有可点击元素
         sb.execute_script("""
@@ -1552,9 +1585,6 @@ def main():
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
 
-    # 订阅链接是凭据，登记后所有诊断输出都会自动抹掉它
-    _register_secret(sub_url)
-
     # 代理模式决策: SUB_URL 优先 → IS_PROXY → 直连
     use_mihomo = False
     proxy_pool = []
@@ -1569,11 +1599,12 @@ def main():
             # 那档验证，跑满 90 分钟也过不去，还白留一条失败记录。
             all_nodes = load_mihomo_nodes()
             if not all_nodes:
-                _diagnose_subscription(sub_url)
+                _diagnose_subscription()
                 stop_mihomo()
                 raise RenewError(
-                    "订阅里没有任何真实节点（provider 多次刷新后代理组仍只有"
-                    " COMPATIBLE 占位符），请检查 SUB_URL 是否过期或被限流。"
+                    "代理组里没有任何真实节点（只剩 COMPATIBLE 占位符）。"
+                    "订阅本身已下载解析成功，所以问题在 mihomo 不认这批节点，"
+                    "看上面的 provider 状态和 mihomo 日志。"
                     "拒绝用 runner 自身的数据中心 IP 直连硬闯 Turnstile。")
 
             proxy_pool = test_mihomo_proxies(all_nodes)
