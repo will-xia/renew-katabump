@@ -59,6 +59,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install seleniumbase requests
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Prepare output directories
         run: |
           mkdir -p output/screenshots

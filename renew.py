@@ -163,17 +163,29 @@ rules:
             pass
         # 仍然尝试继续（可能 API 延迟绑定）
 
-    # 6. 刷新 provider（多等几秒确保完全就绪）
+    # 6. 多等几秒确保完全就绪；provider 刷新交给 load_mihomo_nodes()，
+    #    那里带退避重试，避免订阅偶发 503 就静默退化成直连。
     if mihomo_ready:
         time.sleep(3)
-        try:
-            r = requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=15)
-            _mihomo_log(f"刷新 provider: {r.status_code}")
-            time.sleep(3)
-        except Exception as e:
-            _mihomo_log(f"刷新 provider 失败: {e}")
 
     return True
+
+
+# Mihomo 内置的占位/特殊节点，一个都不能当成真实代理。
+#
+# 其中 COMPATIBLE 是最坑的一个: provider 拉取失败时（比如订阅返回 503），
+# 代理组不会变空，而是只剩这一个占位符，它的行为**等同 DIRECT**。
+# 早先只过滤 DIRECT/REJECT，于是 COMPATIBLE 一路混过测速（走直连当然通），
+# 日志显示「可用节点: 1」，实际流量从 runner 自己的 Azure 数据中心 IP 出去，
+# Turnstile 对着数据中心 IP 只会给最硬的那档验证，必然卡死。
+_PLACEHOLDER_NODES = frozenset({
+    "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL",
+})
+
+
+def _filter_proxy_nodes(all_nodes, group: str = MIHOMO_GROUP) -> list:
+    """从代理组的 all 列表里挑出真实节点，保持原有顺序"""
+    return [n for n in all_nodes if n not in _PLACEHOLDER_NODES and n != group]
 
 
 def get_mihomo_proxies() -> list:
@@ -182,13 +194,45 @@ def get_mihomo_proxies() -> list:
         r = requests.get(f"{MIHOMO_CONTROLLER}/proxies/{MIHOMO_GROUP}", timeout=10)
         data = r.json()
         all_nodes = data.get("all", [])
-        # 过滤掉 DIRECT / REJECT / 组名自身
-        filtered = [n for n in all_nodes if n not in ("DIRECT", "REJECT", MIHOMO_GROUP)]
-        _mihomo_log(f"获取到 {len(filtered)} 个候选节点")
+        filtered = _filter_proxy_nodes(all_nodes)
+        dropped = [n for n in all_nodes if n not in filtered]
+        _mihomo_log(f"获取到 {len(filtered)} 个候选节点"
+                    + (f"（已排除占位节点: {', '.join(dropped)}）" if dropped else ""))
         return filtered
     except Exception as e:
         _mihomo_log(f"获取节点列表失败: {e}")
         return []
+
+
+def _refresh_provider() -> int:
+    """刷新订阅 provider，返回状态码（异常返回 -1）"""
+    try:
+        r = requests.put(f"{MIHOMO_CONTROLLER}/providers/proxies/sub1", timeout=15)
+        _mihomo_log(f"刷新 provider: {r.status_code}")
+        return r.status_code
+    except Exception as e:
+        _mihomo_log(f"刷新 provider 失败: {e}")
+        return -1
+
+
+def load_mihomo_nodes(attempts: int = 4) -> list:
+    """刷新 provider 并取真实节点，失败带退避重试。
+
+    判据只看「过滤后还剩几个真实节点」，不看刷新接口的返回码:
+    返回 204 也可能节点列表为空，返回 503 时上一次加载的节点又可能还在。
+    """
+    for i in range(attempts):
+        _refresh_provider()
+        time.sleep(3)
+        nodes = get_mihomo_proxies()
+        if nodes:
+            return nodes
+        if i < attempts - 1:
+            wait = 3 * (i + 1)
+            _mihomo_log(f"⚠️ 订阅内无真实节点，{wait}s 后重试 "
+                        f"({i + 2}/{attempts})")
+            time.sleep(wait)
+    return []
 
 
 def test_mihomo_proxies(proxy_names: list) -> list:
@@ -548,6 +592,41 @@ def _activate_window():
         pass
 
 
+# 取不到窗口信息时的兜底值（窗口按 set_window_size(1280, 900) 算，
+# Linux 版 Chrome 的标签栏+地址栏合计约 88px）。宁可用估算值，
+# 也不能退化成零偏移 —— 那等于把视口坐标当屏幕坐标用。
+_WIN_FALLBACK = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
+
+
+def _screen_offset(wininfo) -> tuple:
+    """由窗口信息算出「视口坐标 → 屏幕坐标」要加的偏移 (dx, dy)。
+
+    xdotool 收的是 X 屏幕坐标，而 getBoundingClientRect() 给的是视口坐标，
+    两者相差「窗口左上角位置 + 浏览器工具栏高度」。漏掉这段偏移时，
+    点击会稳定落在目标上方 80~90px 处 —— 日志看起来一切正常，实际全打空。
+    """
+    if not wininfo or not wininfo.get("oh") or not wininfo.get("ih"):
+        wininfo = _WIN_FALLBACK
+    bar = max(0, int(wininfo["oh"]) - int(wininfo["ih"]))
+    return int(wininfo.get("sx") or 0), int(wininfo.get("sy") or 0) + bar
+
+
+def _to_screen_point(wininfo, vx, vy) -> tuple:
+    """视口坐标 (vx, vy) → 屏幕坐标，供 xdotool 使用"""
+    dx, dy = _screen_offset(wininfo)
+    return int(vx + dx), int(vy + dy)
+
+
+def _viewport_to_screen(sb, vx, vy) -> tuple:
+    """读一次窗口信息，把视口坐标换算成屏幕坐标"""
+    wininfo = None
+    try:
+        wininfo = _js(sb, _WININFO_JS)
+    except Exception:
+        pass
+    return _to_screen_point(wininfo, vx, vy)
+
+
 def _xdotool_click(x: int, y: int):
     _activate_window()
     try:
@@ -565,6 +644,9 @@ def _xdotool_click(x: int, y: int):
 # switch_to.frame() 也进不去。
 # 但宿主容器 <div class="cf-turnstile"> 本身在普通 DOM 里，位置/尺寸完全可读，
 # checkbox 固定在容器左侧（实测偏移约 21px，垂直居中），据此即可精确点击。
+#
+# 注意: 这里读到的是**视口坐标**，交给 xdotool 前必须过一遍
+# _viewport_to_screen() 换成屏幕坐标，否则点击会落在 widget 上方约 88px。
 _TS_BOX_JS = """
 (function() {
     var c = document.querySelector('.cf-turnstile');
@@ -613,6 +695,12 @@ _TS_DIAG_JS = r"""
     return out;
 })()
 """
+
+
+# checkbox 中心实测在容器左边缘 +21px 处，多备几个候选值应对
+# 不同 data-size 下的细微差异。旧版本用的 (10, 14, 8, 18) 全都偏在
+# checkbox 左侧，叠加当时缺失的坐标换算，六次点击一次都没命中。
+_TS_CHECKBOX_X_OFFSETS = (21, 25, 18, 30)
 
 
 def _cdp_click(sb, x, y):
@@ -735,37 +823,53 @@ def _turnstile_diagnostics(sb, tag: str):
     _save_artifacts(sb, tag)
 
 
-#  人机验证处理（使用 SeleniumBase UC Mode 内置方法，比手动 CDP 点击更可靠）
-def handle_turnstile(sb) -> bool:
-    print("🔍 处理 Cloudflare Turnstile 验证...")
-    _ensure_connected(sb)
-
-    # 阶段 0: 等 widget 渲染出来（api.js 是 async，容器有尺寸才说明渲染完成）
-    box = None
-    for i in range(15):
+#  人机验证处理
+def _wait_turnstile_box(sb, seconds: int = 15):
+    """等 widget 渲染出可见容器（api.js 是 async，容器有尺寸才说明渲染完成）"""
+    for i in range(seconds):
         box = _turnstile_box(sb)
         if box:
             print(f"✅ 定位到 Turnstile widget: "
                   f"({box['x']:.0f},{box['y']:.0f}) {box['w']:.0f}x{box['h']:.0f}（{i+1}s）")
-            break
+            return box
         time.sleep(1)
-    if not box:
-        print("⚠️ Turnstile widget 未渲染出可见容器")
+    print("⚠️ Turnstile widget 未渲染出可见容器")
+    return None
 
-    # 阶段 1: managed / 隐形模式可能自动放行，先短暂等待，避免多余点击
-    print("⏳ 等待 Turnstile 自动通过...")
-    for i in range(12):
+
+def _wait_turnstile_solved(sb, seconds: float, label: str) -> bool:
+    """轮询 hidden input，拿到 token 即算通过"""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
         if _js(sb, _SOLVED_JS):
-            print(f"✅ Turnstile 已自动通过（{i+1}s）")
+            print(f"✅ Turnstile 已通过（{label}，token 长度 {_js(sb, _TOKEN_LEN_JS)}）")
             return True
-        time.sleep(1)
+        time.sleep(0.5)
+    return False
 
-    # 阶段 2: 使用 SeleniumBase UC Mode 内置方法点击 checkbox
-    # Turnstile widget 的 checkbox 在 closed shadow root iframe 内，
-    # 手动 CDP 点击无法穿透，必须用 UC Mode 的 PyAutoGUI 模拟真实鼠标点击
-    # 如未通过，尝试 OS 级 xdotool 物理点击（与 ALTCHA 同源方案）
-    # 如仍未通过，重新加载页面并重试（模拟 Cloudflare challenge 重试流程）
-    print("⚠️ 未自动通过，使用 UC Mode 内置方法点击 Turnstile checkbox...")
+
+def _reset_turnstile(sb):
+    try:
+        _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
+                " catch(e) { return 'reset failed: ' + e.message; } })()")
+        time.sleep(2)
+    except Exception as e:
+        print(f"⚠️ turnstile.reset() 调用异常: {e}")
+
+
+def handle_turnstile(sb) -> bool:
+    """处理登录页的 Cloudflare Turnstile。
+
+    只走 xdotool 的 OS 级点击。SeleniumBase 那两个内置方法
+    （uc_gui_click_cf / uc_gui_click_captcha）在这个页面上是纯空转:
+    它们靠**普通 DOM 里的 iframe 选择器**定位 challenge，而这里
+    document.querySelectorAll('iframe') 返回 0 个（widget 的 iframe 在
+    shadow root 内），选择器命不中就静默 return，连异常都不抛。
+    之前日志里那 12 次「尝试」实际一次都没点下去，纯粹浪费两分钟。
+    """
+    print("🔍 处理 Cloudflare Turnstile 验证...")
+    _ensure_connected(sb)
+
     for round_num in range(2):
         if round_num > 0:
             print(f"🔄 第 {round_num + 1} 轮：重新加载页面后重试...")
@@ -774,120 +878,33 @@ def handle_turnstile(sb) -> bool:
                 time.sleep(8)
             except Exception as e:
                 print(f"⚠️ 页面重载异常: {e}")
-            # 重新等待 widget 渲染
-            box = None
-            for i in range(15):
-                box = _turnstile_box(sb)
-                if box:
-                    print(f"✅ 定位到 Turnstile widget: "
-                          f"({box['x']:.0f},{box['y']:.0f}) {box['w']:.0f}x{box['h']:.0f}（{i+1}s）")
-                    break
-                time.sleep(1)
-            # 等待自动通过
-            print("⏳ 等待 Turnstile 自动通过...")
-            for i in range(12):
-                if _js(sb, _SOLVED_JS):
-                    print(f"✅ Turnstile 已自动通过（{i+1}s）")
-                    return True
-                time.sleep(1)
 
-        # 策略 A: uc_gui_click_cf() - 专门针对 Cloudflare Turnstile 的 PyAutoGUI 点击
-        for attempt in range(3):
-            if _js(sb, _SOLVED_JS):
-                print("✅ Turnstile 已通过")
-                return True
+        box = _wait_turnstile_box(sb)
 
-            try:
-                print(f"🖱️  尝试 uc_gui_click_cf() [尝试 {attempt + 1}]")
-                sb.uc_gui_click_cf()
-                time.sleep(2)
-
-                # 等待验证结果（最多 10 秒）
-                for _ in range(20):
-                    time.sleep(0.5)
-                    if _js(sb, _SOLVED_JS):
-                        token_len = _js(sb, _TOKEN_LEN_JS)
-                        print(f"✅ Turnstile 通过（uc_gui_click_cf，token 长度 {token_len}）")
-                        return True
-            except Exception as e:
-                print(f"⚠️ uc_gui_click_cf() 异常: {e}")
-
-            # reset widget 后重试
-            print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
-            try:
-                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                        " catch(e) { return 'reset failed: ' + e.message; } })()")
-                time.sleep(2)
-            except Exception as e:
-                print(f"⚠️ turnstile.reset() 调用异常: {e}")
-
-        # 策略 B: uc_gui_click_captcha() - 通用方法，自动检测 CAPTCHA 类型
-        for attempt in range(2):
-            if _js(sb, _SOLVED_JS):
-                print("✅ Turnstile 已通过")
-                return True
-
-            try:
-                print(f"🖱️  尝试 uc_gui_click_captcha() [尝试 {attempt + 1}]")
-                sb.uc_gui_click_captcha()
-                time.sleep(2)
-
-                # 等待验证结果
-                for _ in range(20):
-                    time.sleep(0.5)
-                    if _js(sb, _SOLVED_JS):
-                        token_len = _js(sb, _TOKEN_LEN_JS)
-                        print(f"✅ Turnstile 通过（uc_gui_click_captcha，token 长度 {token_len}）")
-                        return True
-            except Exception as e:
-                print(f"⚠️ uc_gui_click_captcha() 异常: {e}")
-
-            # reset widget
-            try:
-                _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                        " catch(e) { return 'reset failed: ' + e.message; } })()")
-                time.sleep(2)
-            except Exception:
-                pass
-
-    # 策略 C: 回退到 xdotool 物理点击（真正的 OS 级输入事件）
-    # Turnstile checkbox 在容器左侧、垂直居中（实测偏移约 10px）
-    print("⚠️ 内置方法均失败，回退到 xdotool 物理点击...")
-    x_offsets = (10, 14, 8, 18)
-    for attempt in range(6):
-        if _js(sb, _SOLVED_JS):
-            print("✅ Turnstile 已通过")
+        # managed / 隐形模式可能自动放行，先等一会儿，避免多余点击
+        print("⏳ 等待 Turnstile 自动通过...")
+        if _wait_turnstile_solved(sb, 12, f"自动通过，第 {round_num + 1} 轮"):
             return True
-
-        box = _turnstile_box(sb) or box
         if not box:
-            print(f"⚠️ 取不到 Turnstile 容器坐标，无法点击 [尝试 {attempt + 1}]")
-            time.sleep(2)
             continue
 
-        dx = x_offsets[attempt % len(x_offsets)]
-        cx = int(box["x"] + dx)
-        cy = int(box["y"] + box["h"] / 2)
-        print(f"🖱️ xdotool 点击 ({cx},{cy}) 容器左偏移 {dx}px [尝试 {attempt + 1}]")
-        _xdotool_click(cx, cy)
-        # 模拟人类操作：点击后短暂停顿，让浏览器处理事件
-        time.sleep(0.5 + (time.time() % 1) * 0.3)
+        for attempt in range(4):
+            dx = _TS_CHECKBOX_X_OFFSETS[attempt % len(_TS_CHECKBOX_X_OFFSETS)]
+            vx = box["x"] + dx
+            vy = box["y"] + box["h"] / 2
+            sx, sy = _viewport_to_screen(sb, vx, vy)
+            print(f"🖱️ xdotool 点击 视口({vx:.0f},{vy:.0f}) → 屏幕({sx},{sy})，"
+                  f"容器左偏移 {dx}px [尝试 {attempt + 1}]")
+            _xdotool_click(sx, sy)
+            # 模拟人类操作：点击后短暂停顿，让浏览器处理事件
+            time.sleep(0.5 + (time.time() % 1) * 0.3)
 
-        # 等待验证结果
-        for _ in range(30):
-            time.sleep(0.5)
-            if _js(sb, _SOLVED_JS):
-                token_len = _js(sb, _TOKEN_LEN_JS)
-                print(f"✅ Turnstile 通过（xdotool 点击，token 长度 {token_len}）")
+            if _wait_turnstile_solved(sb, 15, "xdotool 点击"):
                 return True
 
-        # reset widget
-        try:
-            _js(sb, "(function(){ try { window.turnstile.reset(); return 'reset'; }"
-                    " catch(e) { return 'reset failed: ' + e.message; } })()")
-            time.sleep(2)
-        except Exception as e:
-            print(f"⚠️ turnstile.reset() 调用异常: {e}")
+            print(f"⚠️ 第 {attempt + 1} 次未通过，reset widget 后重试...")
+            _reset_turnstile(sb)
+            box = _turnstile_box(sb) or box
 
     _turnstile_diagnostics(sb, "turnstile_fail")
     return False
@@ -1156,16 +1173,7 @@ def _solve_altcha(sb) -> bool:
             """)
         # 策略 B: xdotool 物理点击 iframe 坐标
         elif coords:
-            wi = None
-            try:
-                wi = _js(sb, _WININFO_JS)
-            except Exception:
-                pass
-            if not wi:
-                wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
-            bar = wi["oh"] - wi["ih"]
-            ax  = coords["cx"] + wi["sx"]
-            ay  = coords["cy"] + wi["sy"] + bar
+            ax, ay = _viewport_to_screen(sb, coords["cx"], coords["cy"])
             print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
             _xdotool_click(ax, ay)
 
@@ -1338,20 +1346,29 @@ def main():
     if sub_url:
         if setup_mihomo(sub_url):
             use_mihomo = True
-            all_nodes = get_mihomo_proxies()
-            if all_nodes:
-                proxy_pool = test_mihomo_proxies(all_nodes)
-                if proxy_pool:
-                    import random
-                    random.shuffle(proxy_pool)
-                    _mihomo_log(f"可用节点: {len(proxy_pool)}")
-                    max_retries = min(5, len(proxy_pool))
-                else:
-                    _mihomo_log("⚠️ 无健康节点，使用直连")
-            else:
-                _mihomo_log("⚠️ 无节点可用，使用直连")
+            # 配了 SUB_URL 就是明确要走代理。此时**不能**回退直连:
+            # runner 自己的 IP 属于数据中心网段，Turnstile 只会给最硬的
+            # 那档验证，跑满 90 分钟也过不去，还白留一条失败记录。
+            all_nodes = load_mihomo_nodes()
+            if not all_nodes:
+                stop_mihomo()
+                raise RenewError(
+                    "订阅里没有任何真实节点（provider 多次刷新后代理组仍只有"
+                    " COMPATIBLE 占位符），请检查 SUB_URL 是否过期或被限流。"
+                    "拒绝用 runner 自身的数据中心 IP 直连硬闯 Turnstile。")
+
+            proxy_pool = test_mihomo_proxies(all_nodes)
+            if not proxy_pool:
+                stop_mihomo()
+                raise RenewError(
+                    f"{len(all_nodes)} 个节点全部测速不通，无可用出口。")
+
+            import random
+            random.shuffle(proxy_pool)
+            _mihomo_log(f"可用节点: {len(proxy_pool)}")
+            max_retries = min(5, len(proxy_pool))
         else:
-            print("⚠️ Mihomo 启动失败，回退直连")
+            raise RenewError("Mihomo 启动失败，且已配置 SUB_URL，拒绝回退直连。")
     elif is_proxy:
         print(f"🔗 挂载单代理: {proxy_str}")
         max_retries = 3
