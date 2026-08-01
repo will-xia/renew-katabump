@@ -3,8 +3,11 @@ name: katabump-renew
 on:
   workflow_dispatch:
   schedule:
-    # 每天北京时间 04:00（cron 只认 UTC，UTC 20:00 = 次日 UTC+8 04:00）
-    - cron: "0 20 * * *"
+    # cron 只认 UTC。每天两次，间隔 12 小时:
+    # 续期窗口是按小时开放的，只跑 04:00 那一次的话，窗口在白天打开就得
+    # 干等到次日 04:00 才续得上；16:00 这次是兜底。
+    - cron: "0 20 * * *"  # 北京 04:00（次日）
+    - cron: "0 8 * * *"   # 北京 16:00
 
 permissions:
   contents: read
