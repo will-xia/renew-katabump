@@ -4,11 +4,13 @@
 import hashlib
 import os
 import re
+import signal
 import sys
 import time
 import subprocess
 import json
 import traceback
+from contextlib import contextmanager
 from urllib.parse import urlparse, parse_qs
 import requests
 import yaml
@@ -44,6 +46,47 @@ def _poll(fn, seconds: float, interval: float = 0.5):
         if time.time() >= deadline:
             return None
         time.sleep(interval)
+
+
+class AttemptTimeout(Exception):
+    """一次尝试卡死: 换个节点重来，不是致命错误"""
+
+
+# 单次尝试（开浏览器 → 登录 → 续期）的硬时间上限。
+# 正常路径最慢约 350s（45s 等 CF + 两轮 Turnstile + ALTCHA），留一倍余量。
+ATTEMPT_TIME_BUDGET = int(os.environ.get("ATTEMPT_TIME_BUDGET") or 600)
+# 超时后清理浏览器的宽限时间: driver.quit() 自己也可能卡住
+CLEANUP_TIME_BUDGET = 60
+
+
+@contextmanager
+def hard_timeout(seconds: int, label: str):
+    """给一段代码套上 SIGALRM 硬超时。
+
+    存在的理由: 挂在网络/驱动上的调用不一定有超时。一个连得上测速地址、
+    却打不开目标站点的节点，能让某个 webdriver 命令一直阻塞下去；没有这道
+    闹钟的话整个 job 就一路挂到 workflow 的 90 分钟超时被 GitHub 取消
+    （"Error: The operation was canceled."）—— 那种收场连汇总和 TG 通知
+    都不会有，日志还会因为缓冲被截断在半句话上。
+
+    Windows 没有 SIGALRM，取不到就退化成不设限（只影响本地调试）。
+    """
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _fire(signum, frame):
+        # 收尾阶段（浏览器退出）也可能卡住，再排一次闹钟兜底
+        signal.alarm(CLEANUP_TIME_BUDGET)
+        raise AttemptTimeout(f"{label} 超过 {seconds}s 未返回，判定卡死")
+
+    prev_handler = signal.signal(signal.SIGALRM, _fire)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev_handler)
 
 # ==========================================
 # ========== Mihomo 代理池模块 ==============
@@ -640,6 +683,26 @@ def _save_cookies(sb, email: str):
         print(f"  ⚠️ 保存 cookies 失败: {e}")
 
 
+def _set_page_load_timeout(sb, seconds: int = 60):
+    """给 driver.get 套上硬上限。
+
+    selenium 默认 300s: 一个连得上测速地址、却打不开目标站点的节点，
+    能让一次导航白等 5 分钟才还回控制权。断连状态下这条命令本身会失败，
+    所以调用点要先 _ensure_connected。
+    """
+    try:
+        sb.driver.set_page_load_timeout(seconds)
+    except Exception:
+        pass
+
+
+def _drop_cookies(path: str):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
 def _load_cookies(sb, email: str) -> bool:
     """Try loading saved cookies and navigate to dashboard.
       Returns True if cookies valid (already logged in), False otherwise.
@@ -650,9 +713,24 @@ def _load_cookies(sb, email: str) -> bool:
     try:
         with open(path) as f:
             cookies = json.load(f)
-        if not isinstance(cookies, list):
-            return False
-        # Use regular navigation so CDP session stays stable for cookie ops
+    except Exception as e:
+        print(f"  ⚠️ cookies 文件读不出来，删掉: {e}")
+        _drop_cookies(path)
+        return False
+    if not isinstance(cookies, list) or not cookies:
+        _drop_cookies(path)
+        return False
+
+    try:
+        # 这一整段用的全是**普通 webdriver 命令**（get / add_cookie /
+        # get_current_url / get_title），必须先确认驱动是连着的。
+        # 断连时 SeleniumBase 会把 sb.get() 悄悄换成 sb.cdp.get()，而那条
+        # 路径超时后只 print 一行 "Timeout loading <url>" 就继续往下走
+        # （不抛异常），于是后面每个 add_cookie 都打在已经被 stop 掉的
+        # chromedriver 上 —— 这就是那次 job 一路挂到 90 分钟被 GitHub
+        # 取消的起点。
+        _ensure_connected(sb)
+        _set_page_load_timeout(sb)
         sb.get(BASE_URL)
         time.sleep(3)
         for cookie in cookies:
@@ -664,15 +742,21 @@ def _load_cookies(sb, email: str) -> bool:
         time.sleep(2)
         url = (sb.get_current_url() or "").lower()
         title = (sb.get_title() or "").lower()
-        if url.startswith(f"{BASE_URL.lower()}/dashboard") or "dashboard | katabump" in title:
-            print("  ✅ 使用已保存的 cookies 登录（跳过 Turnstile）")
-            return True
     except Exception as e:
-        print(f"  ⚠️ cookies 加载失败: {e}")
-    try:
-        os.remove(path)
-    except Exception:
-        pass
+        # 打不开站点 ≠ cookie 失效，绝大多数时候是这个出口节点连不上。
+        # 这种情况一定要**留着**文件: 下一次换节点重试还能靠它跳过
+        # Turnstile，而 Turnstile 是全流程最不稳的一环。
+        print(f"  ⚠️ 带 cookie 打开站点失败，回退正常登录: {e}")
+        return False
+
+    if (url.startswith(f"{BASE_URL.lower()}/dashboard")
+            or "dashboard | katabump" in title):
+        print("  ✅ 使用已保存的 cookies 登录（跳过 Turnstile）")
+        return True
+
+    # 站点确实打开了却没进 dashboard → 会话真的过期了，删掉省得下次白试
+    print(f"  ℹ️ cookies 已失效（URL: {url or '(空)'}），删除后走正常登录")
+    _drop_cookies(path)
     return False
 
 
@@ -1732,36 +1816,48 @@ def main():
             # 白白给后面的验证码环节埋坑。
             print(f"  📍 出口IP: {_check_exit_ip(sb_kwargs.get('proxy'))}")
 
-            with SB(**sb_kwargs) as sb:
-                # 不注入任何 prototype 钩子: 改写 Element.prototype.attachShadow /
-                # MouseEvent.prototype.screenX 会让 toString() 不再是 [native code]，
-                # 属于 Cloudflare 一眼就能识别的篡改特征，而且对定位 widget 毫无帮助
-                # （widget 的 checkbox 在跨域 iframe 内部，不在顶层 shadow root 里）。
-                # 窗口略高一些，保证 Turnstile widget 落在视口内（CDP 点击用视口坐标）
-                try:
-                    sb.set_window_size(1280, 900)
-                except Exception:
-                    pass
+            # 卡死的一次尝试按「这个节点不行」处理，换节点继续 ——
+            # 而不是拖着整个 job 等 GitHub 来砍（见 hard_timeout 的说明）
+            login_ok = False
+            try:
+                with hard_timeout(ATTEMPT_TIME_BUDGET,
+                                  f"账号 {email} 第 {attempt + 1} 次尝试"):
+                    with SB(**sb_kwargs) as sb:
+                        # 不注入任何 prototype 钩子: 改写 Element.prototype.attachShadow /
+                        # MouseEvent.prototype.screenX 会让 toString() 不再是 [native code]，
+                        # 属于 Cloudflare 一眼就能识别的篡改特征，而且对定位 widget 毫无帮助
+                        # （widget 的 checkbox 在跨域 iframe 内部，不在顶层 shadow root 里）。
+                        # 窗口略高一些，保证 Turnstile widget 落在视口内（CDP 点击用视口坐标）
+                        try:
+                            sb.set_window_size(1280, 900)
+                        except Exception:
+                            pass
 
-                # 只有「登录失败」才换节点重试；其它异常留档后直接上抛，
-                # 由 main 记为该账号失败，继续处理下一个账号。
-                try:
-                    login_ok, status = process_account(sb, user)
-                except RenewError:
-                    raise
-                except Exception as e:
-                    print("  ❌ 执行过程中出现未预期异常:")
-                    traceback.print_exc()
-                    try:
-                        _save_artifacts(sb, f"exception_{idx}")
-                    except Exception:
-                        pass
-                    raise RenewError(f"未预期异常: {e}")
+                        _set_page_load_timeout(sb)
 
-                if login_ok:
-                    known_good_node = node_name
-                    return status
+                        # 只有「登录失败」才换节点重试；其它异常留档后直接上抛，
+                        # 由 main 记为该账号失败，继续处理下一个账号。
+                        try:
+                            login_ok, status = process_account(sb, user)
+                        except (RenewError, AttemptTimeout):
+                            raise
+                        except Exception as e:
+                            print("  ❌ 执行过程中出现未预期异常:")
+                            traceback.print_exc()
+                            try:
+                                _save_artifacts(sb, f"exception_{idx}")
+                            except Exception:
+                                pass
+                            raise RenewError(f"未预期异常: {e}")
 
+                        if login_ok:
+                            known_good_node = node_name
+                            return status
+            except AttemptTimeout as e:
+                print(f"  ⏱️ {e}")
+                login_ok = False
+
+            if not login_ok:
                 # 这个节点也过不去了，别再让它拖累后面的账号
                 if node_name and node_name == known_good_node:
                     print("  ♻️ 复用的节点这次没过，取消复用")

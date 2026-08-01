@@ -3,7 +3,8 @@ name: katabump-renew
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 */6 * * *"
+    # 每天北京时间 04:00（cron 只认 UTC，UTC 20:00 = 次日 UTC+8 04:00）
+    - cron: "0 20 * * *"
 
 permissions:
   contents: read
@@ -85,9 +86,12 @@ jobs:
           restore-keys: |
             katabump-cookies-
 
+      # -u 不能省: 步骤的 stdout 是管道（块缓冲），进程一旦被超时/取消
+      # 杀掉，最后那几 KB 日志就跟着没了 —— 上次排查卡死时日志正好断在
+      # 半句话上，看不出到底停在哪一步。
       - name: Run renew script
         run: |
-          xvfb-run -a python renew.py
+          xvfb-run -a python -u renew.py
 
       # 即使脚本失败也要存: 可能只是部分账号失败，成功那些的 cookie 依然有用
       - name: Save cookies

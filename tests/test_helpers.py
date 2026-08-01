@@ -15,6 +15,8 @@
 
 import os
 import sys
+import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -780,6 +782,137 @@ class TestCookiesPath(unittest.TestCase):
         paths = {renew._cookies_path(e) for e in
                  ("xiawei.email@gmail.com", "katabump@i20.de5.net")}
         self.assertEqual(len(paths), 2)
+
+
+class FakeDriver:
+    def __init__(self, connected=True):
+        self._connected = connected
+        self.connect_calls = 0
+
+    def is_connected(self):
+        return self._connected
+
+    def connect(self):
+        self.connect_calls += 1
+        self._connected = True
+
+
+class FakeSB:
+    """只实现 _load_cookies 用到的那几个 webdriver 命令。
+
+    断连状态下调用任何一个都记进 illegal_calls —— 真实驱动上这些命令
+    会打到已经停掉的 chromedriver 上。
+    """
+
+    def __init__(self, url="", title="", connected=True, get_error=None):
+        self.driver = FakeDriver(connected)
+        self.url = url
+        self.title = title
+        self.get_error = get_error
+        self.added = []
+        self.illegal_calls = []
+
+    def _guard(self, name):
+        if not self.driver.is_connected():
+            self.illegal_calls.append(name)
+
+    def get(self, url):
+        self._guard("get")
+        if self.get_error:
+            raise self.get_error
+
+    def add_cookie(self, cookie):
+        self._guard("add_cookie")
+        self.added.append(cookie)
+
+    def get_current_url(self):
+        self._guard("get_current_url")
+        return self.url
+
+    def get_title(self):
+        self._guard("get_title")
+        return self.title
+
+
+class TestLoadCookies(unittest.TestCase):
+    """cookie 快速通道: 不能碰断连的驱动，也不能因为节点不通就删掉会话"""
+
+    EMAIL = "cookie-test@example.com"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patch_renew(self, COOKIES_DIR=tmp.name)
+        self.path = renew._cookies_path(self.EMAIL)
+        with open(self.path, "w") as f:
+            f.write('[{"name": "session", "value": "abc"}]')
+        patch_renew(self, time=mock.MagicMock())  # 不要真的 sleep
+
+    def test_reconnects_driver_before_cookie_ops(self):
+        # 断连时 sb.get() 会被换成 sb.cdp.get()，超时只打一行日志不抛异常，
+        # 后面的 add_cookie 就全打在停掉的 chromedriver 上了
+        sb = FakeSB(url=renew.BASE_URL + "/dashboard", connected=False)
+        self.assertTrue(renew._load_cookies(sb, self.EMAIL))
+        self.assertEqual(sb.illegal_calls, [])
+        self.assertEqual(sb.driver.connect_calls, 1)
+
+    def test_recognizes_dashboard_by_title(self):
+        sb = FakeSB(url="https://dashboard.katabump.com/", title="Dashboard | Katabump")
+        self.assertTrue(renew._load_cookies(sb, self.EMAIL))
+        self.assertEqual(len(sb.added), 1)
+
+    def test_keeps_file_when_site_unreachable(self):
+        # 出口节点打不开站点 ≠ 会话过期。删掉的话下次重试就只能硬闯 Turnstile
+        sb = FakeSB(get_error=RuntimeError("timeout"))
+        self.assertFalse(renew._load_cookies(sb, self.EMAIL))
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_drops_file_when_session_expired(self):
+        # 站点打开了却被踢回登录页 → cookie 真的失效了
+        sb = FakeSB(url=renew.BASE_URL + "/auth/login", title="Login | Katabump")
+        self.assertFalse(renew._load_cookies(sb, self.EMAIL))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_drops_unreadable_file(self):
+        with open(self.path, "w") as f:
+            f.write("{ not json")
+        sb = FakeSB()
+        self.assertFalse(renew._load_cookies(sb, self.EMAIL))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_drops_empty_cookie_list_without_touching_browser(self):
+        with open(self.path, "w") as f:
+            f.write("[]")
+        sb = FakeSB()
+        self.assertFalse(renew._load_cookies(sb, self.EMAIL))
+        self.assertEqual(sb.added, [])
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_missing_file_is_not_an_error(self):
+        os.remove(self.path)
+        self.assertFalse(renew._load_cookies(FakeSB(), self.EMAIL))
+
+
+class TestHardTimeout(unittest.TestCase):
+    """卡死的一次尝试必须被闹钟打断，否则整个 job 挂到被 GitHub 取消"""
+
+    def test_interrupts_a_stuck_call(self):
+        with self.assertRaises(renew.AttemptTimeout):
+            with renew.hard_timeout(1, "测试"):
+                time.sleep(5)
+
+    def test_restores_previous_handler_and_cancels_alarm(self):
+        import signal
+        sentinel = signal.getsignal(signal.SIGALRM)
+        with renew.hard_timeout(30, "测试"):
+            pass
+        self.assertIs(signal.getsignal(signal.SIGALRM), sentinel)
+        # 闹钟已撤: alarm(0) 返回上一个闹钟的剩余秒数
+        self.assertEqual(signal.alarm(0), 0)
+
+    def test_zero_means_no_limit(self):
+        with renew.hard_timeout(0, "测试"):
+            pass  # 不设闹钟，也不该抛
 
 
 class TestVersionConstants(unittest.TestCase):
