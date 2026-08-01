@@ -82,7 +82,7 @@ jobs:
       # 可见，且没有任何 pull_request 触发器，所以外部 PR 读不到它。
       # 一旦仓库转为 public，这一步要重新评估。
       - name: Restore cookies
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: cookies
           key: katabump-cookies-${{ github.run_id }}
@@ -99,7 +99,7 @@ jobs:
       # 即使脚本失败也要存: 可能只是部分账号失败，成功那些的 cookie 依然有用
       - name: Save cookies
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: cookies
           key: katabump-cookies-${{ github.run_id }}
