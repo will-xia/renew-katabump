@@ -893,6 +893,98 @@ class TestLoadCookies(unittest.TestCase):
         self.assertFalse(renew._load_cookies(FakeSB(), self.EMAIL))
 
 
+class FakeLoginSB:
+    """只实现 login() 走「登录页打不开」这条路会用到的命令。
+
+    关键是复刻两个真实行为:
+      * uc_open_with_reconnect 导航超时时**不抛异常**，只 print 一行
+        "Timeout loading <url>" 就返回；
+      * 之后 sb.get_page_source() 走 CDP 通道，页面没加载出来时抛
+        "Element {html} was not found after 7 seconds"，而不是返回空串。
+    """
+
+    def __init__(self, page_source=None, dead_tab=False):
+        self.driver = FakeDriver()
+        self.page_source = page_source
+        self.dead_tab = dead_tab
+        self.source_calls = 0
+        self.opened = []
+
+    def uc_open_with_reconnect(self, url, reconnect_time=None):
+        self.opened.append(url)
+
+    def get_page_source(self):
+        self.source_calls += 1
+        if self.page_source is None:
+            raise Exception("\n Element {html} was not found after 7 seconds!")
+        return self.page_source
+
+    def save_screenshot(self, name, folder=None):
+        pass
+
+    def wait_for_element(self, selector, timeout=None):
+        raise Exception(f"Element {{{selector}}} was not found!")
+
+    def get_current_url(self):
+        if self.dead_tab:
+            raise Exception("tab 已经不可用")
+        return renew.BASE_URL + "/auth/login"
+
+    def get_title(self):
+        if self.dead_tab:
+            raise Exception("tab 已经不可用")
+        return "Just a moment..."
+
+
+class TestLoginPageUnreachable(unittest.TestCase):
+    """导航超时不能变成「未预期异常」。
+
+    uc_open_with_reconnect 打不开页面时只打一行日志就返回，接着那次
+    sb.get_page_source() 会抛 Element {html} not found。这个异常一路上抛会
+    被 run_account 包成 RenewError，而 RenewError 绕过了换节点重试 ——
+    本该「这个出口节点不行，换一个」的失败，变成了账号直接告吹。
+    所以 login() 必须自己收住，返回 False。
+    """
+
+    EMAIL = "login-test@example.com"
+    PASSWORD = "pw"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # _save_artifacts 自己也要读一次源码，会干扰下面数 source_calls 的用例
+        patch_renew(self, COOKIES_DIR=os.path.join(tmp.name, "cookies"),
+                    _save_artifacts=mock.MagicMock(),
+                    time=mock.MagicMock())  # 不要真的 sleep
+
+    def test_unreachable_page_fails_login_instead_of_raising(self):
+        sb = FakeLoginSB(page_source=None)
+        self.assertFalse(renew.login(sb, self.EMAIL, self.PASSWORD))
+        tags = [c.args[1] for c in renew._save_artifacts.call_args_list]
+        self.assertEqual(tags, ["login_page_unreachable"])
+
+    def test_gives_up_early_on_unreachable_page(self):
+        # 取不到源码的那次调用自己要在 CDP 里空等 7 秒，45 轮足够烧掉
+        # 一次尝试的全部时间预算，剩下的节点连试的机会都没有
+        sb = FakeLoginSB(page_source=None)
+        renew.login(sb, self.EMAIL, self.PASSWORD)
+        self.assertLessEqual(sb.source_calls, renew._LOGIN_UNREACHABLE_POLLS)
+
+    def test_detects_login_form_in_page_source(self):
+        # 页面里出现 email 输入框就该立刻跳出等待循环（只查一次源码）
+        sb = FakeLoginSB(page_source='<form><input name="email"></form>')
+        renew.login(sb, self.EMAIL, self.PASSWORD)
+        self.assertEqual(sb.source_calls, 1)
+
+    def test_dead_tab_diagnostics_do_not_raise(self):
+        # 页面能取到源码但没有表单 → 走 wait_for_element 失败的诊断分支，
+        # 这时 get_current_url / get_title 自己也可能抛，不能让诊断代码
+        # 把一次干净的 return False 变回「未预期异常」
+        sb = FakeLoginSB(page_source="<html>Just a moment...</html>",
+                         dead_tab=True)
+        self.assertFalse(renew.login(sb, self.EMAIL, self.PASSWORD))
+
+
 class TestHardTimeout(unittest.TestCase):
     """卡死的一次尝试必须被闹钟打断，否则整个 job 挂到被 GitHub 取消"""
 

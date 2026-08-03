@@ -962,6 +962,21 @@ def _ensure_connected(sb):
         print(f"⚠️ 重新连接驱动失败: {e}")
 
 
+def _page_source(sb) -> str:
+    """取当前页面 HTML，取不到就返回空串。
+
+    断连 + CDP 模式下 sb.get_page_source() 会走 cdp.find_element("html")，
+    页面根本没加载出来时它抛「Element {html} was not found after 7 seconds」，
+    而不是返回空串。轮询点必须自己兜住: 这个异常上抛会被 run_account 包成
+    RenewError，而 RenewError 绕过了换节点重试，一次导航超时就让整个账号
+    告吹 —— 本该按「这个出口节点打不开站点」换个节点继续。
+    """
+    try:
+        return sb.get_page_source() or ""
+    except Exception:
+        return ""
+
+
 #  底层输入工具
 def js_fill_input(sb, selector: str, text: str):
     safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
@@ -1314,6 +1329,12 @@ def handle_turnstile(sb) -> bool:
 
 
 #  账户登录
+# 连续这么多轮取不到页面源码，就认定这个出口节点打不开登录页。
+# 不能死等满 45 轮: 取不到源码的那次调用本身要在 CDP 里空等 7 秒，
+# 45 轮足够烧掉一次尝试的全部时间预算，后面的节点连试的机会都没有。
+_LOGIN_UNREACHABLE_POLLS = 5
+
+
 def login(sb, email: str, password: str) -> bool:
     # 尝试使用已保存的 cookies 跳过登录（跳过 Turnstile）
     print("🔍 检查已保存的 cookies...")
@@ -1328,12 +1349,24 @@ def login(sb, email: str, password: str) -> bool:
     # 先等待 Cloudflare 验证通过（最多等 45 秒）
     print("⏳ 等待 Cloudflare 验证通过...")
     cf_passed = False
+    unreachable = 0
     for i in range(45):
-        page_src = sb.get_page_source() or ""
-        if 'input[name="email"]' in page_src.lower() or 'name="email"' in page_src.lower():
+        # uc_open_with_reconnect 导航超时时**不抛异常**，只 print 一行
+        # "Timeout loading <url>" 就返回，此时 tab 里连 <html> 都取不到。
+        page_src = _page_source(sb).lower()
+        if 'name="email"' in page_src:
             cf_passed = True
             print(f"✅ Cloudflare 验证已通过（{i+1}s）")
             break
+        if page_src:
+            unreachable = 0
+        else:
+            unreachable += 1
+            if unreachable >= _LOGIN_UNREACHABLE_POLLS:
+                print(f"❌ 连续 {unreachable} 轮取不到页面内容，"
+                      "按「这个出口节点打不开登录页」处理")
+                _save_artifacts(sb, "login_page_unreachable")
+                return False
         time.sleep(1)
     if not cf_passed:
         print("⚠️ Cloudflare 验证可能未通过，继续尝试...")
@@ -1346,10 +1379,13 @@ def login(sb, email: str, password: str) -> bool:
             sb.wait_for_element('input[name="Email"]', timeout=5)
         except Exception:
             print("❌ 页面未加载出登录表单")
-            cur_url = sb.get_current_url()
-            page_title = sb.get_title() or ""
-            print(f"  当前 URL: {cur_url}")
-            print(f"  当前标题: {page_title}")
+            try:
+                print(f"  当前 URL: {sb.get_current_url()}")
+                print(f"  当前标题: {sb.get_title() or ''}")
+            except Exception as e:
+                # 页面彻底不可用时这两条命令自己也会抛。别让诊断代码把
+                # 一次干净的 return False（→ 换节点重试）又变成「未预期异常」。
+                print(f"  当前 URL / 标题取不到: {e}")
             _save_artifacts(sb, "login_load_fail")
             return False
 
