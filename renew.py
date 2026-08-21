@@ -52,6 +52,14 @@ class AttemptTimeout(Exception):
     """一次尝试卡死: 换个节点重来，不是致命错误"""
 
 
+class SessionLost(Exception):
+    """会话在续期流程中途失效（被弹回登录页）: 换个节点重登，不是致命错误
+
+    刻意**不**继承 RenewError —— RenewError 绕过了 run_account 的换节点重试，
+    而这种失败和「登录失败」同属可恢复的一类。
+    """
+
+
 # 单次尝试（开浏览器 → 登录 → 续期）的硬时间上限。
 # 正常路径最慢约 350s（45s 等 CF + 两轮 Turnstile + ALTCHA），留一倍余量。
 ATTEMPT_TIME_BUDGET = int(os.environ.get("ATTEMPT_TIME_BUDGET") or 600)
@@ -599,6 +607,68 @@ def test_mihomo_proxies(proxy_names: list) -> list:
     return healthy
 
 
+# 落地稳定性抽检: 只抽池子最前面这几个。
+# 抽检一个节点要先切过去、再连查两次出口 IP，196 个节点全查一遍能把一次
+# job 的时间预算烧光；而实际用得到的节点最多 max_retries(≤5) 个，抽检
+# 范围只要略大于它就够——多出来的那一个是备胎。
+_STABILITY_SAMPLE = 6
+# 抽检用的查询超时比默认的 10s 短: 这一步是加分项，不值得为一个查不通的
+# 节点等满两轮。第一次就查不到会直接跳过第二次。
+_STABILITY_IP_TIMEOUT = 6
+
+
+def _probe_exit_stability(name: str, proxy: str) -> tuple:
+    """切到 name 上连查两次出口 IP，返回 (是否稳定, 说明串)
+
+    两次采样只能抓到「每条连接换一个落地」这种明显的轮换，抓不到按时间
+    轮换的。所以结论只用来排序、不用来删节点。
+
+    查不到 IP 时一律按稳定处理: 抽检自己失败说明不了节点有问题，不能凭这个
+    把一个测速通过的节点降权。
+    """
+    if not switch_mihomo_proxy(name):
+        return True, "切换失败，跳过抽检"
+    time.sleep(0.5)
+    first = _check_exit_ip(proxy, timeout=_STABILITY_IP_TIMEOUT)
+    if not _is_ip(first):
+        return True, f"出口 IP 查不到 {first}，跳过抽检"
+    second = _check_exit_ip(proxy, timeout=_STABILITY_IP_TIMEOUT)
+    if not _is_ip(second):
+        return True, f"第二次查不到 {second}，跳过抽检"
+    if first != second:
+        return False, f"落地会漂: {first} → {second}"
+    return True, f"落地稳定: {first}"
+
+
+def sort_by_exit_stability(pool: list, proxy: str,
+                           sample: int = _STABILITY_SAMPLE) -> list:
+    """抽检池子最前面几个节点的落地稳定性，把会漂的排到队尾
+
+    katabump 的会话认出口 IP。一个每条连接都换落地的节点能通过测速、也能
+    登录，却会在流程中途（点 'See' 进详情页那一下）把会话丢掉 —— 表现是
+    「详情页找不到 Renew 按钮」，和真实原因八竿子打不着。测速只问「通不
+    通」，问不出这件事，所以在这里补一道。
+
+    会漂的节点不丢掉，只排到最后: 两次采样的判定本身就可能是偶然，而且
+    稳定的用光时它们仍然比「没节点可用」好。
+    """
+    if len(pool) < 2:
+        return pool
+
+    head, rest = pool[:sample], pool[sample:]
+    _mihomo_log(f"抽检前 {len(head)} 个节点的落地稳定性（会话认出口 IP）...")
+    stable, drifting = [], []
+    for name in head:
+        ok, why = _probe_exit_stability(name, proxy)
+        _mihomo_log(f"  {'✅' if ok else '⚠️'} {name}: {why}")
+        (stable if ok else drifting).append(name)
+
+    if drifting:
+        # 没抽检过的（rest）排在会漂的前面: 未知好过已知会漂
+        _mihomo_log(f"{len(drifting)} 个节点落地会漂，已排到队尾")
+    return stable + rest + drifting
+
+
 def _pick_node(pool: list, index: int, attempt: int, known_good) -> tuple:
     """挑这次尝试用哪个节点，返回 (节点名, 新的轮换下标, 是否是复用)
 
@@ -936,15 +1006,53 @@ def _js(sb, expression):
             raise first_err
 
 
-def _check_exit_ip(proxy: str = None) -> str:
-    """查询出口 IP（不经过浏览器，避免打乱驱动连接状态）"""
+def _check_exit_ip(proxy: str = None, timeout: int = 10) -> str:
+    """查询出口 IP（不经过浏览器，避免打乱驱动连接状态）
+
+    查不到时返回括号包起来的说明串而不是抛异常/空串 —— 调用点大多是在打
+    日志，这样能把「查不到」原样打出来。要判断拿到的是不是 IP，用 _is_ip。
+    """
     proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        r = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=10,
+        r = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=timeout,
                          headers={"User-Agent": "Mozilla/5.0"})
         return (r.text or "").strip() or "(空响应)"
     except Exception as e:
         return f"(查询失败: {e})"
+
+
+def _is_ip(value: str) -> bool:
+    """_check_exit_ip 的返回值是真 IP 还是「查不到」的说明串"""
+    return bool(value) and not value.startswith("(")
+
+
+# 本次尝试开始时的出口 IP 和当时用的代理。会话中途失效时回查一次做对比:
+# IP 变了说明这个节点在轮换出口（katabump 的会话认 IP，一换就被踢），
+# 没变则是服务端自己把会话作废了 —— 两种原因的应对完全不同，日志里必须分得清。
+_EXIT_IP = ""
+_EXIT_PROXY = None
+
+
+def _remember_exit_ip(proxy: str = None) -> str:
+    """查一次出口 IP 并记下来，返回查询结果"""
+    global _EXIT_IP, _EXIT_PROXY
+    _EXIT_PROXY = proxy
+    _EXIT_IP = _check_exit_ip(proxy)
+    return _EXIT_IP
+
+
+def _exit_ip_drift() -> str:
+    """出口 IP 和尝试开始时不一样了就返回 "旧 → 新"，否则返回空串
+
+    查询失败（返回值形如 "(查询失败: ...)"）不算变化: 拿不到数据说明不了
+    任何事，报成「IP 变了」只会把排查引到错的方向。
+    """
+    if not _is_ip(_EXIT_IP):
+        return ""
+    now = _check_exit_ip(_EXIT_PROXY)
+    if _is_ip(now) and now != _EXIT_IP:
+        return f"{_EXIT_IP} → {now}"
+    return ""
 
 
 def _ensure_connected(sb):
@@ -1466,6 +1574,34 @@ def _read_alert(sb):
         return ""
 
 
+def _assert_session_alive(sb, email, where: str):
+    """确认当前页面还在登录态；被弹回登录页就抛 SessionLost
+
+    真实发生过一次: dashboard 正常渲染、'See' 链接也点到了，落地页却是
+    /auth/login。后面每一步都在登录页上找元素，最终报成「服务器详情页找不到
+    Renew 按钮」—— 一个和真实原因（会话没了）毫无关系的结论，而且因为是
+    RenewError，还绕过了换节点重试，账号直接告吹。
+    """
+    try:
+        url = (sb.get_current_url() or "").lower()
+    except Exception:
+        # 页面彻底不可用时这条命令自己也会抛。这里只负责识别登录页，
+        # 取不到 URL 就交回原来的失败路径处理。
+        return
+    if "/auth/login" not in url:
+        return
+
+    # 这份会话已经不作数了，留着只会让下一次尝试再走一遍 cookie 快速通道，
+    # 白白多烧一个节点。
+    _drop_cookies(_cookies_path(email))
+    drift = _exit_ip_drift()
+    if drift:
+        print(f"  📍 出口 IP 变了: {drift}（同一节点在轮换出口，"
+              "会话跟着被踢）")
+    _save_artifacts(sb, "session_lost")
+    raise SessionLost(f"{where}时被弹回登录页，会话已失效（URL: {url}）")
+
+
 def _goto_server_detail(sb, email=EMAIL) -> bool:
     """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
     print("\n🖥️  正在进入服务器续期页...")
@@ -1524,6 +1660,8 @@ def _goto_server_detail(sb, email=EMAIL) -> bool:
                     print(f"       - [{txt}] -> {href}")
         except Exception:
             pass
+        # 整张表都不见了，先分清是「会话没了」还是「页面真的变了」
+        _assert_session_alive(sb, email, "在 Dashboard 找 'See' 链接")
         _save_artifacts(sb, "servers_page_fail")
         raise RenewError("Dashboard 上找不到进入服务器详情页的 'See' 链接")
 
@@ -1531,10 +1669,12 @@ def _goto_server_detail(sb, email=EMAIL) -> bool:
     see_link.click()
     time.sleep(5)
     print(f"📄 当前页面: {sb.get_current_url()}")
+    # dashboard 能打开不代表 /servers/edit 也认这份会话（实测被弹回登录页过）
+    _assert_session_alive(sb, email, "点击 'See' 进入详情页")
     return True
 
 
-def _open_renew_modal(sb) -> bool:
+def _open_renew_modal(sb, email=EMAIL) -> bool:
     """滚动到 Renew 按钮并点击，打开模态框"""
     print("\n🔄 查找 Renew 按钮...")
     try:
@@ -1544,6 +1684,8 @@ def _open_renew_modal(sb) -> bool:
             renew_btn = sb.find_element('button.btn.btn-outline-primary', timeout=5)
         except Exception:
             print("  ❌ 未找到 Renew 按钮")
+            # 登录页上当然没有 Renew 按钮: 别把会话失效报成页面结构问题
+            _assert_session_alive(sb, email, "在服务器详情页找 Renew 按钮")
             _save_artifacts(sb, "renew_button_missing")
             raise RenewError("服务器详情页找不到 Renew 按钮")
 
@@ -1565,6 +1707,7 @@ def _open_renew_modal(sb) -> bool:
         return True
     except Exception:
         print("⚠️ 模态框未弹出")
+        _assert_session_alive(sb, email, "等待 Renew 模态框")
         _save_artifacts(sb, "renew_modal_missing")
         raise RenewError("点击 Renew 后模态框没有弹出")
 
@@ -1697,6 +1840,8 @@ def _check_renew_result(sb, email=EMAIL) -> str:
 
     if not alert_text:
         print("❌ 未检测到任何提示框，无法确认续期是否生效")
+        # 提交后被踢回登录页也是「没有提示框」，但那是会话问题，可以重来
+        _assert_session_alive(sb, email, "读取续期结果")
         _save_artifacts(sb, "renew_no_alert")
         return "error"
 
@@ -1727,7 +1872,7 @@ def renew_server(sb, email=EMAIL) -> str:
     if not _goto_server_detail(sb, email=email):
         return "skip"
 
-    _open_renew_modal(sb)
+    _open_renew_modal(sb, email=email)
 
     if not _solve_altcha(sb):
         raise RenewError("续期弹窗的 ALTCHA 人机验证未通过")
@@ -1805,6 +1950,9 @@ def main():
 
             import random
             random.shuffle(proxy_pool)
+            # 洗牌之后再抽检落地稳定性: 抽的就是这次真正会用到的那几个
+            proxy_pool = sort_by_exit_stability(
+                proxy_pool, f"http://127.0.0.1:{MIHOMO_MIXED_PORT}")
             _mihomo_log(f"可用节点: {len(proxy_pool)}")
             max_retries = min(5, len(proxy_pool))
         else:
@@ -1825,6 +1973,7 @@ def main():
         """跑单个账号（含换节点重试），返回 "ok" / "skip"；失败抛 RenewError"""
         nonlocal proxy_index, known_good_node
 
+        fail_reason = ""   # 最后一次尝试失败的原因，用于汇总和 TG 通知
         for attempt in range(max_retries):
             if attempt > 0:
                 print(f"\n  [重试 {attempt + 1}/{max_retries}]")
@@ -1850,7 +1999,7 @@ def main():
             # UC 模式下 sb.open() 会把驱动切进 CDP 模式并断开连接，
             # 之后 execute_script 的语义、execute_cdp_cmd 的可用性全变，
             # 白白给后面的验证码环节埋坑。
-            print(f"  📍 出口IP: {_check_exit_ip(sb_kwargs.get('proxy'))}")
+            print(f"  📍 出口IP: {_remember_exit_ip(sb_kwargs.get('proxy'))}")
 
             # 卡死的一次尝试按「这个节点不行」处理，换节点继续 ——
             # 而不是拖着整个 job 等 GitHub 来砍（见 hard_timeout 的说明）
@@ -1875,6 +2024,12 @@ def main():
                         # 由 main 记为该账号失败，继续处理下一个账号。
                         try:
                             login_ok, status = process_account(sb, user)
+                        except SessionLost as e:
+                            # 会话中途没了和「登录失败」同属可恢复失败:
+                            # 换个节点、丢掉 cookie 重新登一次就好
+                            print(f"  🔁 {e}")
+                            fail_reason = str(e)
+                            login_ok = False
                         except (RenewError, AttemptTimeout):
                             raise
                         except Exception as e:
@@ -1891,6 +2046,7 @@ def main():
                             return status
             except AttemptTimeout as e:
                 print(f"  ⏱️ {e}")
+                fail_reason = str(e)
                 login_ok = False
 
             if not login_ok:
@@ -1900,9 +2056,12 @@ def main():
                     known_good_node = None
 
                 if attempt == max_retries - 1:
-                    send_tg_message("❌", "登录失败", f"{max_retries} 次尝试均未成功",
-                                    email=email)
-                    raise RenewError(f"{max_retries} 次尝试后仍然登录失败")
+                    # 带上最后一次的失败原因: 只说「登录失败」的话，会话中途
+                    # 失效这类问题在日志汇总里看不出和真·登录失败的区别
+                    detail = (f"{max_retries} 次尝试均未成功"
+                              + (f"；最后一次: {fail_reason}" if fail_reason else ""))
+                    send_tg_message("❌", "登录失败", detail, email=email)
+                    raise RenewError(f"{max_retries} 次尝试后仍然登录失败（{detail}）")
 
     failures = []
     try:

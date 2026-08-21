@@ -750,6 +750,99 @@ class TestPickNode(unittest.TestCase):
         self.assertTrue(reused)
 
 
+class FakeExits:
+    """按节点给出「连查两次出口 IP」的结果，用来模拟落地轮换
+
+    ips[节点] 给一个序列: 每查一次弹一个，最后一个留着重复用。
+    """
+
+    def __init__(self, ips, switch_fail=()):
+        self.ips = {name: list(seq) for name, seq in ips.items()}
+        self.switch_fail = set(switch_fail)
+        self.active = None
+        self.switched = []
+        self.queries = 0
+
+    def switch(self, name):
+        if name in self.switch_fail:
+            return False
+        self.active = name
+        self.switched.append(name)
+        return True
+
+    def check(self, proxy=None, timeout=None):
+        self.queries += 1
+        seq = self.ips.get(self.active) or ["(查询失败: 没配)"]
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+
+class TestSortByExitStability(unittest.TestCase):
+    """落地会漂的节点要排到队尾。
+
+    katabump 的会话认出口 IP: 每条连接都换落地的节点能测速通过、也能登录，
+    却会在点 'See' 进详情页那一下把会话丢掉（表现成「找不到 Renew 按钮」）。
+    测速只问通不通，问不出这件事。
+    """
+
+    PROXY = "http://127.0.0.1:7890"
+
+    def _install(self, ips, switch_fail=()):
+        fake = FakeExits(ips, switch_fail)
+        patch_renew(self, switch_mihomo_proxy=fake.switch,
+                    _check_exit_ip=fake.check,
+                    time=mock.MagicMock())  # 不要真的 sleep
+        return fake
+
+    def test_drifting_node_goes_last(self):
+        self._install({"a": ["1.1.1.1"], "b": ["5.5.5.5", "9.9.9.9"]})
+        # 没抽检过的 c/d 排在已知会漂的 b 前面: 未知好过已知会漂
+        self.assertEqual(
+            renew.sort_by_exit_stability(["a", "b", "c", "d"], self.PROXY, sample=2),
+            ["a", "c", "d", "b"])
+
+    def test_stable_pool_keeps_order(self):
+        self._install({"a": ["1.1.1.1"], "b": ["2.2.2.2"]})
+        self.assertEqual(
+            renew.sort_by_exit_stability(["a", "b"], self.PROXY, sample=2),
+            ["a", "b"])
+
+    def test_unqueryable_ip_counts_as_stable(self):
+        # 抽检自己失败说明不了节点有问题，不能凭这个把测速通过的节点降权
+        self._install({"a": ["(查询失败: timeout)"], "b": ["2.2.2.2"]})
+        self.assertEqual(
+            renew.sort_by_exit_stability(["a", "b"], self.PROXY, sample=2),
+            ["a", "b"])
+
+    def test_gives_up_after_first_failed_query(self):
+        # 第一次就查不到时不该再等第二轮超时
+        fake = self._install({"a": ["(查询失败: timeout)"]})
+        renew.sort_by_exit_stability(["a", "b"], self.PROXY, sample=1)
+        self.assertEqual(fake.queries, 1)
+
+    def test_switch_failure_skips_probe(self):
+        fake = self._install({"a": ["1.1.1.1"]}, switch_fail=["a"])
+        self.assertEqual(
+            renew.sort_by_exit_stability(["a", "b"], self.PROXY, sample=1),
+            ["a", "b"])
+        self.assertEqual(fake.queries, 0)
+
+    def test_single_node_pool_is_not_probed(self):
+        # 只有一个节点时排序毫无意义，别白花一次切换 + 两次查询
+        fake = self._install({"a": ["1.1.1.1", "2.2.2.2"]})
+        self.assertEqual(renew.sort_by_exit_stability(["a"], self.PROXY), ["a"])
+        self.assertEqual((fake.switched, fake.queries), ([], 0))
+
+    def test_sample_larger_than_pool(self):
+        self._install({"a": ["1.1.1.1", "8.8.8.8"], "b": ["2.2.2.2"]})
+        self.assertEqual(
+            renew.sort_by_exit_stability(["a", "b"], self.PROXY, sample=99),
+            ["b", "a"])
+
+    def test_sample_covers_the_nodes_actually_used(self):
+        # 抽检范围要盖住一次 job 真正会用到的节点数（max_retries 上限 5）
+        self.assertGreaterEqual(renew._STABILITY_SAMPLE, 5)
+
+
 class TestCookiesPath(unittest.TestCase):
     """cookie 文件按账号隔离 —— 撞名会导致串号登录"""
 
@@ -983,6 +1076,143 @@ class TestLoginPageUnreachable(unittest.TestCase):
         sb = FakeLoginSB(page_source="<html>Just a moment...</html>",
                          dead_tab=True)
         self.assertFalse(renew.login(sb, self.EMAIL, self.PASSWORD))
+
+
+class FakeLink:
+    def __init__(self, href="", text="See"):
+        self.href = href
+        self.text = text
+        self.clicks = 0
+
+    def get_attribute(self, name):
+        return self.href if name == "href" else ""
+
+    def click(self):
+        self.clicks += 1
+
+
+class FakeRenewSB:
+    """续期流程用到的那几个命令；页面元素按选择器查表返回"""
+
+    def __init__(self, url, elements=None):
+        self.driver = FakeDriver()
+        self.url = url
+        self.elements = elements or {}
+        self.screenshots = []
+
+    def get_current_url(self):
+        return self.url
+
+    def get_title(self):
+        return ""
+
+    def find_element(self, selector, timeout=None):
+        if selector in self.elements:
+            return self.elements[selector]
+        raise Exception(f"Element {{{selector}}} was not found!")
+
+    def find_elements(self, selector):
+        return []
+
+    def execute_script(self, script):
+        return None
+
+    def save_screenshot(self, name, folder=None):
+        self.screenshots.append(name)
+
+    def get_page_source(self):
+        return "<html></html>"
+
+
+class TestSessionLost(unittest.TestCase):
+    """会话中途失效必须被认出来，而不是报成「页面结构变了」
+
+    真实发生过: dashboard 正常渲染、'See' 也点到了，落地页却是 /auth/login。
+    之后每一步都在登录页上找元素，最后报「服务器详情页找不到 Renew 按钮」——
+    结论和真实原因无关，而且因为是 RenewError 还绕过了换节点重试。
+    """
+
+    EMAIL = "session-test@example.com"
+    LOGIN_URL = renew.BASE_URL + "/auth/login"
+    DASH_URL = renew.BASE_URL + "/dashboard"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patch_renew(self, COOKIES_DIR=tmp.name,
+                    _save_artifacts=mock.MagicMock(),
+                    _check_exit_ip=mock.MagicMock(return_value="1.2.3.4"),
+                    time=mock.MagicMock())  # 不要真的 sleep
+        self.path = renew._cookies_path(self.EMAIL)
+        with open(self.path, "w") as f:
+            f.write('[{"name": "session", "value": "abc"}]')
+
+    def test_not_a_renew_error(self):
+        # 继承了 RenewError 就会被 run_account 直接上抛，丧失换节点重试
+        self.assertFalse(issubclass(renew.SessionLost, renew.RenewError))
+
+    def test_login_page_raises_and_drops_cookies(self):
+        sb = FakeRenewSB(self.LOGIN_URL)
+        with self.assertRaises(renew.SessionLost):
+            renew._assert_session_alive(sb, self.EMAIL, "测试")
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(renew._save_artifacts.call_args.args[1], "session_lost")
+
+    def test_normal_page_is_a_noop(self):
+        sb = FakeRenewSB(self.DASH_URL)
+        renew._assert_session_alive(sb, self.EMAIL, "测试")
+        self.assertTrue(os.path.exists(self.path))
+        renew._save_artifacts.assert_not_called()
+
+    def test_unavailable_url_does_not_raise(self):
+        sb = FakeRenewSB(self.DASH_URL)
+        sb.get_current_url = mock.MagicMock(side_effect=Exception("tab 没了"))
+        renew._assert_session_alive(sb, self.EMAIL, "测试")   # 交回原失败路径
+
+    def test_see_click_landing_on_login_page(self):
+        link = FakeLink(href=renew.BASE_URL + "/servers/edit?id=1")
+        # 真实日志里点击后的落地页就是登录页，链接本身还在 dashboard 上找到了
+        sb = FakeRenewSB(self.LOGIN_URL,
+                         {'a[href*="/servers/edit?id="]': link})
+        with self.assertRaises(renew.SessionLost):
+            renew._goto_server_detail(sb, email=self.EMAIL)
+        self.assertEqual(link.clicks, 1)
+
+    def test_missing_renew_button_on_login_page(self):
+        # 登录页上当然没有 Renew 按钮，别把它报成详情页结构问题
+        sb = FakeRenewSB(self.LOGIN_URL)
+        with self.assertRaises(renew.SessionLost):
+            renew._open_renew_modal(sb, email=self.EMAIL)
+
+    def test_missing_renew_button_while_logged_in_is_fatal(self):
+        # 会话还在却找不到按钮 → 页面真的变了，这才是 RenewError
+        sb = FakeRenewSB(renew.BASE_URL + "/servers/edit?id=1")
+        with self.assertRaises(renew.RenewError):
+            renew._open_renew_modal(sb, email=self.EMAIL)
+
+
+class TestExitIpDrift(unittest.TestCase):
+    """会话失效时报出口 IP 变化: 查不到就别报，免得把排查引偏"""
+
+    def test_reports_change(self):
+        patch_renew(self, _EXIT_IP="1.1.1.1", _EXIT_PROXY=None,
+                    _check_exit_ip=mock.MagicMock(return_value="2.2.2.2"))
+        self.assertEqual(renew._exit_ip_drift(), "1.1.1.1 → 2.2.2.2")
+
+    def test_same_ip_is_silent(self):
+        patch_renew(self, _EXIT_IP="1.1.1.1", _EXIT_PROXY=None,
+                    _check_exit_ip=mock.MagicMock(return_value="1.1.1.1"))
+        self.assertEqual(renew._exit_ip_drift(), "")
+
+    def test_failed_lookup_is_not_a_change(self):
+        patch_renew(self, _EXIT_IP="1.1.1.1", _EXIT_PROXY=None,
+                    _check_exit_ip=mock.MagicMock(return_value="(查询失败: boom)"))
+        self.assertEqual(renew._exit_ip_drift(), "")
+
+    def test_unknown_baseline_is_not_a_change(self):
+        patch_renew(self, _EXIT_IP="(查询失败: boom)", _EXIT_PROXY=None,
+                    _check_exit_ip=mock.MagicMock(return_value="2.2.2.2"))
+        self.assertEqual(renew._exit_ip_drift(), "")
 
 
 class TestHardTimeout(unittest.TestCase):
