@@ -1191,6 +1191,236 @@ class TestSessionLost(unittest.TestCase):
             renew._open_renew_modal(sb, email=self.EMAIL)
 
 
+class FakeSubmitButton:
+    def __init__(self, page):
+        self.page = page
+
+    def click(self):
+        # 灰掉的按钮在真实浏览器里点了也不会触发任何行为
+        if self.page.disabled:
+            self.page.blocked_clicks += 1
+            return
+        self.page.click_submit()
+
+
+class FakeRenewPage:
+    """改版后的续期弹窗替身: 只认 renew.py 里那几段 JS 常量
+
+    按脚本原文分派而不是靠关键字猜，脚本一改这里就会炸出来。
+
+    构造参数描述页面的「性格」:
+      mode          —— _ALTCHA_MODE_JS 的返回值
+      autosolve     —— 点了提交后第几次轮询时 PoW 算完（None = 页面脚本压根没跑）
+      autosubmit    —— 算完后页面会不会自己把表单发出去
+      trigger_works —— 我们手动踢 widget 时能不能解出 payload
+      alert_after   —— 表单发出去后第几次读取才渲染出提示
+    """
+
+    def __init__(self, mode="onsubmit", autosolve=2, autosubmit=True,
+                 disabled=False, trigger_works=True, alert="Server renewed!",
+                 alert_after=0, url=None):
+        self.driver = FakeDriver()
+        self.url = url or (renew.BASE_URL + "/servers/edit?id=1")
+        self.mode = mode
+        self.autosolve = autosolve
+        self.autosubmit = autosubmit
+        self.disabled = disabled
+        self.trigger_works = trigger_works
+        self.alert = alert
+        self.alert_after = alert_after
+        self.running = disabled      # 按钮一开始就灰着 = 验证已经在跑
+        self.payload = 0
+        self.marked = False
+        self.submitted = False       # 表单发出去了，页面重载
+        self.forced = False          # 走了 form.submit() 兜底
+        self.clicks = 0
+        self.blocked_clicks = 0
+        self.triggered = 0
+        self.screenshots = []
+        self._ticks = 0
+        self._alert_reads = 0
+
+    # --- 页面自身的行为 ---
+
+    def click_submit(self):
+        self.clicks += 1
+        self.running = True
+        self.disabled = True         # altcha-progress.js 立刻置灰成 Verifying...
+
+    def _advance(self):
+        """验证跑起来之后，每轮询一次往前走一步"""
+        if not self.running or self.submitted:
+            return
+        self._ticks += 1
+        if self.autosolve is not None and self._ticks >= self.autosolve:
+            self.payload = 96
+            if self.autosubmit:
+                self.submitted = True
+
+    @property
+    def label(self):
+        if not self.disabled:
+            return "Renew"
+        return "Verifying... 100%" if self.payload else "Verifying... 0%"
+
+    # --- sb 接口 ---
+
+    def execute_script(self, script):
+        body = script[len("return "):] if script.startswith("return ") else script
+        body = body.strip()
+        if body == renew._MARK_JS.strip():
+            self.marked = True
+            return 1
+        if body == renew._SUBMITTED_JS.strip():
+            self._advance()
+            # 表单一发出去页面就重载，window 上的记号跟着没了
+            return "navigated" if self.submitted else None
+        if body == renew._RENEW_FORM_JS.strip():
+            return {"disabled": self.disabled, "label": self.label,
+                    "payload": self.payload}
+        if body == renew._CLICK_SUBMIT_JS.strip():
+            self.click_submit()
+            return "button"
+        if body == renew._FORCE_SUBMIT_JS.strip():
+            self.forced = True
+            self.submitted = True
+            return True
+        if body == renew._ALTCHA_MODE_JS.strip():
+            return self.mode
+        if body == renew._ALTCHA_TRIGGER_JS.strip():
+            self.triggered += 1
+            if self.trigger_works:
+                self.payload = 96
+            return "verify()"
+        if body == renew._ALTCHA_SOLVED_JS.strip():
+            return bool(self.payload)
+        if body == renew._ALERT_TEXT_JS.strip():
+            if not self.submitted:
+                return ""
+            self._alert_reads += 1
+            return self.alert if self._alert_reads > self.alert_after else ""
+        raise AssertionError(f"意料之外的脚本: {body[:60]}")
+
+    def find_element(self, selector, timeout=None):
+        if selector == 'div.modal.show form button[type="submit"]':
+            return FakeSubmitButton(self)
+        raise Exception(f"Element {{{selector}}} was not found!")
+
+    def find_elements(self, selector):
+        return []
+
+    def get_current_url(self):
+        return self.url
+
+    def get_title(self):
+        return ""
+
+    def save_screenshot(self, name, folder=None):
+        self.screenshots.append(name)
+
+    def get_page_source(self):
+        return "<html></html>"
+
+
+class TestRenewSubmit(unittest.TestCase):
+    """提交续期表单: 点完按钮要等到表单真的发出去
+
+    锁死 run 33020798364 的失败: 站点把 ALTCHA 改成 auto="onsubmit" 且整行
+    藏了起来，我们仍抢先点复选框 —— 验证跑完后提交按钮永远停在 disabled 的
+    「Verifying... 100%」，我们那一下点击成了空操作，payload 生成了却没人提交
+    表单，最后报成「未检测到任何提示框」。
+    """
+
+    EMAIL = "renew-test@example.com"
+
+    def setUp(self):
+        patch_renew(self, time=FakeClock(),
+                    _save_artifacts=mock.MagicMock(),
+                    send_tg_message=mock.MagicMock())
+
+    def test_hidden_widget_is_not_touched(self):
+        # onsubmit 形态下任何手动点击都会把按钮锁死，这里连点击脚本都不该发
+        page = FakeRenewPage(mode="onsubmit")
+        self.assertTrue(renew._solve_altcha(page))
+        self.assertEqual(page.triggered, 0)
+        self.assertEqual(page.clicks, 0)
+
+    def test_missing_widget_defers_to_submit(self):
+        # 没有 widget 就别自己判「验证失败」，交给提交结果说话
+        page = FakeRenewPage(mode="none")
+        self.assertTrue(renew._solve_altcha(page))
+
+    def test_visible_widget_still_uses_the_click_path(self):
+        # 老版可见复选框的处理逻辑必须原样保留
+        page = FakeRenewPage(mode="interactive")
+        page.payload = 96                      # 走到「已自动通过」那一支
+        self.assertTrue(renew._solve_altcha(page))
+
+    def test_waits_for_the_page_to_submit(self):
+        page = FakeRenewPage(autosolve=3, autosubmit=True)
+        renew._submit_renew(page, email=self.EMAIL)
+        self.assertEqual(page.clicks, 1)
+        self.assertTrue(page.submitted)
+        self.assertFalse(page.forced)          # 页面自己提交了，不必兜底
+
+    def test_stuck_at_verifying_falls_back_to_direct_submit(self):
+        # 就是线上那次: payload 有了，按钮灰着，页面脚本再也不动
+        page = FakeRenewPage(autosolve=2, autosubmit=False)
+        renew._submit_renew(page, email=self.EMAIL)
+        self.assertTrue(page.forced)
+        self.assertEqual(page.triggered, 0)    # payload 现成的，别再验证一次
+        renew._save_artifacts.assert_not_called()
+
+    def test_disabled_button_is_never_clicked(self):
+        # 进来时按钮已经灰着（验证在跑），点它只是空操作
+        page = FakeRenewPage(autosolve=2, autosubmit=False, disabled=True)
+        renew._submit_renew(page, email=self.EMAIL)
+        self.assertEqual(page.clicks, 0)
+        self.assertEqual(page.blocked_clicks, 0)
+        self.assertTrue(page.forced)
+
+    def test_triggers_altcha_when_the_page_script_never_runs(self):
+        page = FakeRenewPage(autosolve=None, trigger_works=True)
+        renew._submit_renew(page, email=self.EMAIL)
+        self.assertEqual(page.triggered, 1)
+        self.assertTrue(page.forced)
+
+    def test_reports_the_button_state_when_nothing_works(self):
+        page = FakeRenewPage(autosolve=None, trigger_works=False)
+        with self.assertRaises(renew.RenewError) as caught:
+            renew._submit_renew(page, email=self.EMAIL)
+        self.assertIn("Verifying", str(caught.exception))
+        self.assertEqual(renew._save_artifacts.call_args.args[1],
+                         "renew_submit_stuck")
+
+    def test_session_lost_on_submit_is_recoverable(self):
+        # 提交时被弹回登录页 → SessionLost，可以换节点重来，不是 RenewError
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patch_renew(self, COOKIES_DIR=tmp.name,
+                    _check_exit_ip=mock.MagicMock(return_value="1.2.3.4"))
+        page = FakeRenewPage(autosolve=None, trigger_works=False,
+                             url=renew.BASE_URL + "/auth/login")
+        with self.assertRaises(renew.SessionLost):
+            renew._submit_renew(page, email=self.EMAIL)
+
+    def test_result_waits_for_the_alert_to_render(self):
+        # 表单刚发出去，提示要等页面重载完才出现，别读一次就下结论
+        page = FakeRenewPage(autosolve=1, alert_after=3,
+                             alert="You can't renew your server yet.")
+        renew._submit_renew(page, email=self.EMAIL)
+        self.assertEqual(renew._check_renew_result(page, email=self.EMAIL),
+                         "skip")
+
+    def test_result_gives_up_when_no_alert_ever_shows(self):
+        page = FakeRenewPage(autosolve=1, alert="")
+        renew._submit_renew(page, email=self.EMAIL)
+        self.assertEqual(renew._check_renew_result(page, email=self.EMAIL),
+                         "error")
+        self.assertEqual(renew._save_artifacts.call_args.args[1],
+                         "renew_no_alert")
+
+
 class TestExitIpDrift(unittest.TestCase):
     """会话失效时报出口 IP 变化: 查不到就别报，免得把排查引偏"""
 

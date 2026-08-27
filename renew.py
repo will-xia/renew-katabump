@@ -954,6 +954,41 @@ _ALTCHA_EXPAND_JS = """
 })()
 """
 
+# 判断续期弹窗里的 ALTCHA 是哪一种形态: "interactive" / "onsubmit" / "none"
+#
+# 2026-08-26 站点改版后，widget 被整行藏了起来并改成提交时才验证:
+#     <div class="row mb-3 altcha-hidden">
+#       <altcha-widget challengeurl="..." auto="onsubmit">
+# PoW 由页面自己在点提交时发起，assets/js/altcha-progress.js 负责把提交按钮
+# 置灰成「Verifying... X%」，算完再由脚本提交表单。
+#
+# 这种形态下**绝不能**抢先去点复选框: 验证是我们触发的，页面脚本那边没有
+# 待提交的表单，按钮就永远停在 disabled 的「Verifying... 100%」上，之后
+# 点它全是空操作 —— payload 生成了却没人把表单发出去（run 33020798364
+# 就是这样: 截图里弹窗还开着，按钮灰着，一条提示都没有）。
+_ALTCHA_MODE_JS = """
+(function(){
+    var modal = document.querySelector('div.modal.show') || document;
+    var w = modal.querySelector('altcha-widget');
+    if (!w) return 'none';
+    if ((w.getAttribute('auto') || '').toLowerCase() === 'onsubmit') return 'onsubmit';
+    return w.getClientRects().length ? 'interactive' : 'onsubmit';
+})()
+"""
+
+# 手动踢一脚 widget（只在页面脚本没把验证跑起来时用）
+_ALTCHA_TRIGGER_JS = """
+(function(){
+    var modal = document.querySelector('div.modal.show') || document;
+    var w = modal.querySelector('altcha-widget');
+    if (!w) return 'no-widget';
+    if (typeof w.verify === 'function') { w.verify(); return 'verify()'; }
+    var cb = w.querySelector('input[type="checkbox"]');
+    if (cb) { cb.click(); return 'checkbox'; }
+    return 'no-handle';
+})()
+"""
+
 # 检测 ALTCHA 是否已验证通过
 _ALTCHA_SOLVED_JS = """
 (function(){
@@ -1565,13 +1600,36 @@ def login(sb, email: str, password: str) -> bool:
 
 # ===== 自动续期流程 =====
 
+# 逐个筛出**可见**且有文字的 alert
+_ALERT_TEXT_JS = """
+(function(){
+    var list = document.querySelectorAll('div.alert');
+    for (var i = 0; i < list.length; i++) {
+        if (!list[i].getClientRects().length) continue;
+        var t = (list[i].innerText || list[i].textContent || '').replace(/\\s+/g, ' ').trim();
+        if (t) return t;
+    }
+    return '';
+})()
+"""
+
+
 def _read_alert(sb):
-    """读取页面第一个 Bootstrap alert 的文本，找不到返回空串"""
+    """读取页面上第一个可见 Bootstrap alert 的文本，找不到返回空串
+
+    用 JS 逐个筛而不是 sb.find_element('div.alert'): 后者（等同
+    wait_for_element_visible）只盯 DOM 里的**第一个** .alert，那个若是隐藏的
+    模板，下面就算真有提示也只会一路等到超时，最后报「没有提示框」。
+    """
     try:
-        el = sb.find_element("div.alert", timeout=4)
-        return (el.text or "").strip()
+        return (_js(sb, _ALERT_TEXT_JS) or "").strip()
     except Exception:
-        return ""
+        # JS 通道不可用（驱动断连等）时退回原来的查找方式
+        try:
+            el = sb.find_element("div.alert", timeout=4)
+            return (el.text or "").strip()
+        except Exception:
+            return ""
 
 
 def _assert_session_alive(sb, email, where: str):
@@ -1712,10 +1770,33 @@ def _open_renew_modal(sb, email=EMAIL) -> bool:
         raise RenewError("点击 Renew 后模态框没有弹出")
 
 
+def _altcha_mode(sb) -> str:
+    """当前弹窗里 ALTCHA 的形态: "interactive" / "onsubmit" / "none" """
+    try:
+        return _js(sb, _ALTCHA_MODE_JS) or "none"
+    except Exception:
+        return "none"
+
+
 def _solve_altcha(sb) -> bool:
     """处理 ALTCHA 人机验证"""
     print("\n🔐 处理 ALTCHA 人机验证...")
     time.sleep(2)
+
+    # widget 是 ES module 渲染的，可能比模态框慢一两拍，别急着判定「没有」
+    mode = "none"
+    for _ in range(6):
+        mode = _altcha_mode(sb)
+        if mode != "none":
+            break
+        time.sleep(1)
+
+    if mode != "interactive":
+        # onsubmit: 页面自己会在提交时验证，我们插手只会把按钮锁死（见
+        # _ALTCHA_MODE_JS 的注释）。none: 压根没有 widget 可点，与其在这里
+        # 猜「验证失败」，不如把判断交给提交结果 —— 服务端不认自然会回错误提示。
+        print(f"ℹ️ ALTCHA 交给页面在提交时自行验证（mode={mode}），不手动点击")
+        return True
 
     # 先检查是否已自动通过
     if _js(sb, _ALTCHA_SOLVED_JS):
@@ -1808,23 +1889,127 @@ def _solve_altcha(sb) -> bool:
     return False
 
 
-def _submit_renew(sb):
-    """点击模态框内的 Renew 提交按钮"""
-    print("🖱️  点击模态框中的 Renew 按钮...")
+# 续期表单当前状态: 提交按钮能不能点、上面写着什么、altcha payload 有多长
+_RENEW_FORM_JS = """
+(function(){
+    var modal = document.querySelector('div.modal.show');
+    if (!modal) return null;
+    var form = modal.querySelector('form[action*="renew"]') || modal.querySelector('form');
+    if (!form) return null;
+    var btn = form.querySelector('button[type="submit"]')
+           || modal.querySelector('button.btn-primary');
+    var payload = form.querySelector('input[name="altcha"]');
+    return {
+        disabled: btn ? !!btn.disabled : true,
+        label: btn ? (btn.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40)
+                   : '(无提交按钮)',
+        payload: (payload && payload.value) ? payload.value.length : 0
+    };
+})()
+"""
+
+# 元素点不到时的兜底点击。requestSubmit() 会照常触发 submit 事件，
+# altcha 的 auto="onsubmit" 拦截器仍然生效。
+_CLICK_SUBMIT_JS = """
+(function(){
+    var modal = document.querySelector('div.modal.show');
+    if (!modal) return 'no-modal';
+    var form = modal.querySelector('form[action*="renew"]') || modal.querySelector('form');
+    var btn = form ? form.querySelector('button[type="submit"]') : null;
+    if (btn && !btn.disabled) { btn.click(); return 'button'; }
+    if (form && form.requestSubmit) { form.requestSubmit(); return 'requestSubmit'; }
+    return 'none';
+})()
+"""
+
+# 表单到底发出去没有: 弹窗消失（表单一提交页面就整页重载）+ 提交前在 window
+# 上做的记号也没了 = 换了一个 document。两个条件都要，记号万一没设上，
+# 「弹窗还在」这条仍拦得住。
+#
+# 不拿「顶部有没有 alert」当判据 —— 详情页本来就可能挂着别的提示，
+# 那样会把提交前的旧提示当成续期结果。
+_MARK_JS = "(function(){ window.__kbRenewMark = 1; return 1; })()"
+_SUBMITTED_JS = """
+(function(){
+    if (document.querySelector('div.modal.show')) return null;
+    return window.__kbRenewMark ? 'modal-gone' : 'navigated';
+})()
+"""
+
+# 最后的兜底: payload 已经躺在表单里，只差没人提交。form.submit() 不触发
+# submit 事件，正好绕开 altcha 拦截器和卡住的页面脚本，直接把现成的
+# payload POST 出去（csrf 也在同一个 form 里，字段一个不少）。
+_FORCE_SUBMIT_JS = """
+(function(){
+    var modal = document.querySelector('div.modal.show');
+    var form = modal && (modal.querySelector('form[action*="renew"]')
+                      || modal.querySelector('form'));
+    if (!form) return false;
+    HTMLFormElement.prototype.submit.call(form);
+    return true;
+})()
+"""
+
+
+def _renew_form_state(sb):
+    """读取续期表单状态，读不到返回 None"""
     try:
-        submit = sb.find_element('div.modal.show button.btn-primary', timeout=5)
-        submit.click()
+        return _js(sb, _RENEW_FORM_JS)
     except Exception:
-        sb.execute_script("""
-            (function(){
-                var m = document.querySelector('div.modal.show');
-                if (!m) return;
-                var bs = m.querySelectorAll('button');
-                for (var i = 0; i < bs.length; i++)
-                    if (/renew/i.test(bs[i].textContent)) bs[i].click();
-            })()
-        """)
-    time.sleep(3)
+        return None
+
+
+def _submit_renew(sb, email=EMAIL):
+    """提交续期表单，并等到它真的发出去
+
+    点完按钮不等于提交完成: 新版页面先在后台算 ALTCHA 的 PoW（按钮置灰成
+    「Verifying... X%」），算完才由脚本提交表单。以前这里 sleep 3 秒就去读
+    结果，页面还没走完就被判成「没有提示框」。
+    """
+    try:
+        _js(sb, _MARK_JS)
+    except Exception as e:
+        print(f"  ⚠️ 记号没设上（{e}），只能靠弹窗是否消失判断提交")
+    state = _renew_form_state(sb) or {}
+
+    if state.get("disabled"):
+        # 按钮一上来就是灰的 = 验证已经在跑，再点也只是空操作
+        print(f"⏳ 提交按钮暂不可点（{state.get('label')}），等页面自己走完验证")
+    else:
+        print("🖱️  点击模态框中的 Renew 按钮...")
+        try:
+            sb.find_element('div.modal.show form button[type="submit"]',
+                            timeout=5).click()
+        except Exception:
+            print(f"  ⚠️ 按钮点不到，改用 JS 提交: {_js(sb, _CLICK_SUBMIT_JS)}")
+
+    landed = _poll(lambda: _js(sb, _SUBMITTED_JS), 45, 1)
+    if landed:
+        print(f"✅ 续期表单已提交（{landed}）")
+        return
+
+    state = _renew_form_state(sb) or {}
+    print(f"⚠️ 45 秒内表单没发出去（按钮: {state.get('label', '?')}，"
+          f"altcha payload: {state.get('payload', 0)} 字节）")
+
+    if not state.get("payload"):
+        # 验证根本没跑起来（页面脚本没接管 / widget 没加载），自己踢一脚
+        print(f"  🔁 手动触发 ALTCHA: {_js(sb, _ALTCHA_TRIGGER_JS)}")
+        _poll(lambda: (_renew_form_state(sb) or {}).get("payload"), 30, 1)
+        state = _renew_form_state(sb) or {}
+
+    if state.get("payload"):
+        print("  🚀 payload 已就绪，绕开页面脚本直接提交表单")
+        _js(sb, _FORCE_SUBMIT_JS)
+        landed = _poll(lambda: _js(sb, _SUBMITTED_JS), 30, 1)
+        if landed:
+            print(f"✅ 续期表单已提交（{landed}）")
+            return
+
+    _assert_session_alive(sb, email, "提交续期表单")
+    _save_artifacts(sb, "renew_submit_stuck")
+    raise RenewError(
+        f"点击 Renew 后表单始终没有提交（按钮状态: {state.get('label') or '未知'}）")
 
 
 def _check_renew_result(sb, email=EMAIL) -> str:
@@ -1833,10 +2018,8 @@ def _check_renew_result(sb, email=EMAIL) -> str:
     返回 "ok"（续期成功）/ "skip"（未到续期时间）/ "error"（无法确认结果）。
     """
     print("\n📋 检查续期结果...")
-    alert_text = _read_alert(sb)
-    if not alert_text:
-        time.sleep(3)
-        alert_text = _read_alert(sb)
+    # 表单刚发出去，页面可能还在重载: 给提示一点渲染时间
+    alert_text = _poll(lambda: _read_alert(sb), 15, 1)
 
     if not alert_text:
         print("❌ 未检测到任何提示框，无法确认续期是否生效")
@@ -1877,7 +2060,7 @@ def renew_server(sb, email=EMAIL) -> str:
     if not _solve_altcha(sb):
         raise RenewError("续期弹窗的 ALTCHA 人机验证未通过")
 
-    _submit_renew(sb)
+    _submit_renew(sb, email=email)
     status = _check_renew_result(sb, email=email)
     if status == "error":
         raise RenewError("已提交 Renew，但页面未返回可识别的成功提示")
