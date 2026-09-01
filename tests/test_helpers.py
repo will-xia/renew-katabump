@@ -947,6 +947,41 @@ class TestNodeStats(unittest.TestCase):
         renew.record_node_result("a", True)     # 落盘失败不该中断整个流程
 
 
+class TestRetryBudget(unittest.TestCase):
+    """换节点重试的时间闸门
+
+    多试几个节点是过 Turnstile 唯一有效的手段，但不能试到被 workflow 的
+    硬超时砍掉 —— 那样汇总、TG 通知、cookie 和战绩的保存全都不会发生。
+    """
+
+    def test_plenty_of_time_left(self):
+        now = 1000.0
+        deadline = now + renew.ATTEMPT_TIME_BUDGET * 3
+        self.assertFalse(renew.retry_budget_exhausted(deadline, now))
+
+    def test_stops_when_one_attempt_would_not_fit(self):
+        now = 1000.0
+        deadline = now + renew.ATTEMPT_TIME_BUDGET - 1
+        self.assertTrue(renew.retry_budget_exhausted(deadline, now))
+
+    def test_past_deadline(self):
+        self.assertTrue(renew.retry_budget_exhausted(500.0, 1000.0))
+
+    def test_no_deadline_means_no_limit(self):
+        # 本地跑不设预算，不该被这道闸门拦住
+        for empty in (0, None):
+            self.assertFalse(renew.retry_budget_exhausted(empty, 1e12))
+
+    def test_attempt_cap_uses_the_job_budget(self):
+        """上限得留得下不止几次尝试，否则这道闸门根本没机会生效"""
+        self.assertGreaterEqual(
+            renew.JOB_TIME_BUDGET,
+            renew.ATTEMPT_TIME_BUDGET * 2,
+            "job 预算连两次尝试都放不下")
+        self.assertGreater(renew.MAX_LOGIN_ATTEMPTS, 5,
+                           "5 次尝试只用掉 90 分钟预算里的一小半")
+
+
 class FakeExits:
     """按节点给出「连查两次出口 IP」的结果，用来模拟落地轮换
 

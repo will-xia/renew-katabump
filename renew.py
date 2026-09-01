@@ -68,6 +68,30 @@ ATTEMPT_TIME_BUDGET = int(os.environ.get("ATTEMPT_TIME_BUDGET") or 600)
 # 超时后清理浏览器的宽限时间: driver.quit() 自己也可能卡住
 CLEANUP_TIME_BUDGET = 60
 
+# 单个账号最多换多少个节点重试。
+#
+# 能否过 Turnstile 基本只取决于出口 IP 的口碑，池子里过得去的是少数，
+# 所以「多试几个节点」是唯一真正有效的手段: run 33460916838 第 2 个节点
+# 首击就过，run 33461833328 连试 4 个都没过。原来的上限 5 只用掉 90 分钟
+# 预算里的约 20 分钟，把剩下的余量白白扔了。
+MAX_LOGIN_ATTEMPTS = int(os.environ.get("MAX_LOGIN_ATTEMPTS") or 12)
+
+# 整个 job 的软预算。workflow 的硬超时是 90 分钟，真被它砍掉的话汇总、
+# TG 通知、cookie 和节点战绩的保存全都不会发生，所以自己提前收手。
+JOB_TIME_BUDGET = int(os.environ.get("JOB_TIME_BUDGET") or 75 * 60)
+
+
+def retry_budget_exhausted(deadline, now=None) -> bool:
+    """时间还够不够再开一次尝试
+
+    一次尝试最坏要烧掉 ATTEMPT_TIME_BUDGET，剩的时间不够就别起头了 ——
+    开到一半被硬超时砍掉，等于既没试成、又把收尾工作一起赔进去。
+    deadline 为 0/None 表示不限时（本地跑）。
+    """
+    if not deadline:
+        return False
+    return (now if now is not None else time.time()) + ATTEMPT_TIME_BUDGET > deadline
+
 
 @contextmanager
 def hard_timeout(seconds: int, label: str):
@@ -2389,6 +2413,10 @@ def main():
     print("   katabump 自动登录续期")
     print("#" * 25)
 
+    # 从进程启动就开始算: 测速和落地抽检本身也要花好几分钟，
+    # 那部分同样要从预算里扣掉。
+    job_deadline = time.time() + JOB_TIME_BUDGET if JOB_TIME_BUDGET else 0
+
     users = load_users()
     if not users:
         raise RenewError("未配置任何账号（USERS_JSON / KATABUMP_EMAIL）")
@@ -2442,7 +2470,7 @@ def main():
             proxy_pool = sort_by_exit_stability(
                 proxy_pool, f"http://127.0.0.1:{MIHOMO_MIXED_PORT}")
             _mihomo_log(f"可用节点: {len(proxy_pool)}")
-            max_retries = min(5, len(proxy_pool))
+            max_retries = min(MAX_LOGIN_ATTEMPTS, len(proxy_pool))
         else:
             raise RenewError("Mihomo 初始化失败（订阅下载/解析失败或进程未起来），"
                              "且已配置 SUB_URL，拒绝回退直连。")
@@ -2462,9 +2490,15 @@ def main():
         nonlocal proxy_index, known_good_node
 
         fail_reason = ""   # 最后一次尝试失败的原因，用于汇总和 TG 通知
+        tried = 0
         for attempt in range(max_retries):
             if attempt > 0:
+                if retry_budget_exhausted(job_deadline):
+                    print(f"  ⏳ 剩余时间不够再开一次尝试，停在第 {attempt} 次")
+                    fail_reason = fail_reason or "job 时间预算用尽"
+                    break
                 print(f"\n  [重试 {attempt + 1}/{max_retries}]")
+            tried = attempt + 1
 
             # 切换代理节点（挑选逻辑见 _pick_node）
             node_name = None
@@ -2546,13 +2580,14 @@ def main():
                     print("  ♻️ 复用的节点这次没过，取消复用")
                     known_good_node = None
 
-                if attempt == max_retries - 1:
-                    # 带上最后一次的失败原因: 只说「登录失败」的话，会话中途
-                    # 失效这类问题在日志汇总里看不出和真·登录失败的区别
-                    detail = (f"{max_retries} 次尝试均未成功"
-                              + (f"；最后一次: {fail_reason}" if fail_reason else ""))
-                    send_tg_message("❌", "登录失败", detail, email=email)
-                    raise RenewError(f"{max_retries} 次尝试后仍然登录失败（{detail}）")
+        # 循环走完还没 return，就是全都没成。
+        # 这段刻意放在循环**外面**: 原来挂在「attempt == max_retries - 1」上，
+        # 一旦有别的路径提前 break（比如时间预算用尽），函数就会返回 None，
+        # 而 None 既不是 "skip" 也不抛错 —— 会被静默记成一次成功。
+        detail = (f"{tried} 次尝试均未成功"
+                  + (f"；最后一次: {fail_reason}" if fail_reason else ""))
+        send_tg_message("❌", "登录失败", detail, email=email)
+        raise RenewError(f"{tried} 次尝试后仍然登录失败（{detail}）")
 
     failures = []
     try:
