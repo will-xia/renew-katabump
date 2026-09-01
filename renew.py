@@ -27,6 +27,8 @@ class RenewError(Exception):
 #  失败证据留档（workflow 只上传 output/ 目录，写到别处等于丢弃）
 OUTPUT_DIR = os.path.join(os.getcwd(), "output")
 ARTIFACT_DIR = os.path.join(OUTPUT_DIR, "screenshots")
+# 跨运行保留的状态（由 CI 缓存带到下一次运行），目前只有节点战绩
+STATE_DIR = os.path.join(os.getcwd(), "state")
 
 
 def _poll(fn, seconds: float, interval: float = 0.5):
@@ -681,6 +683,93 @@ def _pick_node(pool: list, index: int, attempt: int, known_good) -> tuple:
     if attempt == 0 and known_good:
         return known_good, index, True
     return pool[index % len(pool)], index + 1, False
+
+
+#  节点战绩（跨运行）
+# 能否过 Turnstile 几乎只取决于出口 IP 的口碑，而一份订阅里过得去的是少数:
+# run 33460916838 里 BE_1 连点 4 次不过，紧接着 DE_5 首击就过，token 816 字符。
+# 每次运行都从几百个节点里重新随机摸，等于把上次花掉的试错成本全扔了。
+# 这里把「过过」和「没过」记下来，下次运行优先用过过的那些。
+NODE_STATS_PATH = os.path.join(STATE_DIR, "good_nodes.json")
+
+# 文件里最多留这么多条: 订阅有几百个节点，无限增长既没用也难读。
+_NODE_STATS_MAX = 40
+# 净负多少次就把这条记录忘掉，免得一条陈年战绩一直霸着队首
+_NODE_FORGET_AFTER = 3
+
+
+def _load_node_stats() -> dict:
+    """读节点战绩，读不到/坏了都返回空 dict —— 这只是加速，不是必需品"""
+    try:
+        with open(NODE_STATS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ 节点战绩读取失败（当作没有）: {e}")
+        return {}
+
+
+def _save_node_stats(stats: dict):
+    # 只留最近成功过的那批，其余丢掉
+    keep = sorted(stats.items(),
+                  key=lambda kv: kv[1].get("last_ok", 0),
+                  reverse=True)[:_NODE_STATS_MAX]
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(NODE_STATS_PATH, "w") as f:
+            json.dump(dict(keep), f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        print(f"⚠️ 节点战绩保存失败（不影响本次运行）: {e}")
+
+
+def record_node_result(name, ok: bool):
+    """记下某个节点这次登录成没成
+
+    每次都立刻落盘: 这个 job 随时可能被超时砍掉，攒着批量写等于白记。
+    文件很小，写的代价可以忽略。
+    """
+    if not name:
+        return
+    stats = _load_node_stats()
+    entry = stats.get(name) or {"ok": 0, "fail": 0, "last_ok": 0}
+    if ok:
+        entry["ok"] = entry.get("ok", 0) + 1
+        entry["last_ok"] = int(time.time())
+    else:
+        entry["fail"] = entry.get("fail", 0) + 1
+    stats[name] = entry
+    if not ok and entry["fail"] - entry["ok"] >= _NODE_FORGET_AFTER:
+        stats.pop(name, None)
+    _save_node_stats(stats)
+
+
+def prefer_known_good_nodes(pool: list, stats=None) -> list:
+    """把以前过过 Turnstile 的节点提到池子最前面，返回新的顺序
+
+    只提名字还在**本次健康池**里的: 订阅每次拉下来节点会增减（375 → 374
+    是常事），记住的名字不一定还存在，更不一定还测得通。
+
+    没有任何命中时原样返回 —— 第一次跑、或订阅整个换掉时，不该有任何
+    行为变化。战绩净负的也不提: 那说明它更可能是个坏节点。
+    """
+    if stats is None:
+        stats = _load_node_stats()
+
+    scored = []
+    for name in pool:
+        s = stats.get(name)
+        if not isinstance(s, dict) or s.get("ok", 0) <= s.get("fail", 0):
+            continue
+        scored.append((s.get("last_ok", 0), s.get("ok", 0), name))
+    if not scored:
+        return list(pool)
+
+    scored.sort(reverse=True)
+    good = [name for _, _, name in scored]
+    seen = set(good)
+    return good + [name for name in pool if name not in seen]
 
 
 def switch_mihomo_proxy(name: str) -> bool:
@@ -2339,6 +2428,16 @@ def main():
 
             import random
             random.shuffle(proxy_pool)
+
+            # 洗牌之后、抽检之前，把以前过过 Turnstile 的节点提到队首。
+            # 顺序很讲究: 抽检取的是池子最前面几个，正好落在这批节点上，
+            # 而抽检仍然能把其中落地会漂的那些重新压到队尾。
+            node_stats = _load_node_stats()
+            proxy_pool = prefer_known_good_nodes(proxy_pool, node_stats)
+            known = sum(1 for n in proxy_pool if n in node_stats)
+            if known:
+                _mihomo_log(f"{known} 个节点有历史战绩，过过 Turnstile 的已排到队首")
+
             # 洗牌之后再抽检落地稳定性: 抽的就是这次真正会用到的那几个
             proxy_pool = sort_by_exit_stability(
                 proxy_pool, f"http://127.0.0.1:{MIHOMO_MIXED_PORT}")
@@ -2432,6 +2531,8 @@ def main():
 
                         if login_ok:
                             known_good_node = node_name
+                            # 记进跨运行的战绩，下次运行优先从这些里挑
+                            record_node_result(node_name, True)
                             return status
             except AttemptTimeout as e:
                 print(f"  ⏱️ {e}")
@@ -2439,6 +2540,7 @@ def main():
                 login_ok = False
 
             if not login_ok:
+                record_node_result(node_name, False)
                 # 这个节点也过不去了，别再让它拖累后面的账号
                 if node_name and node_name == known_good_node:
                     print("  ♻️ 复用的节点这次没过，取消复用")

@@ -877,6 +877,76 @@ class TestPickNode(unittest.TestCase):
         self.assertTrue(reused)
 
 
+class TestNodeStats(unittest.TestCase):
+    """跨运行的节点战绩: 记住谁过过 Turnstile，下次优先用
+
+    cookie 总会过期，过期那次就得重新从几百个节点里摸一个能过的。
+    run 33451554684 连挂 5 个节点就是这么来的。
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        patch_renew(self, STATE_DIR=self.dir,
+                    NODE_STATS_PATH=os.path.join(self.dir, "good_nodes.json"))
+
+    def test_records_and_prefers_a_winner(self):
+        renew.record_node_result("DE_5", True)
+        self.assertEqual(renew.prefer_known_good_nodes(["BE_1", "DE_5", "US_1"]),
+                         ["DE_5", "BE_1", "US_1"])
+
+    def test_most_recent_winner_goes_first(self):
+        clock = FakeClock()       # last_ok 是秒级时间戳，别为此真睡一秒
+        patch_renew(self, time=clock)
+        renew.record_node_result("old", True)
+        clock.sleep(60)
+        renew.record_node_result("new", True)
+        self.assertEqual(
+            renew.prefer_known_good_nodes(["a", "old", "b", "new"])[:2],
+            ["new", "old"])
+
+    def test_net_losing_node_is_not_promoted(self):
+        renew.record_node_result("flaky", True)
+        renew.record_node_result("flaky", False)
+        # 1 胜 1 负算不上「过得去」，不该占队首
+        self.assertEqual(renew.prefer_known_good_nodes(["a", "flaky"]),
+                         ["a", "flaky"])
+
+    def test_forgets_a_node_that_keeps_losing(self):
+        for _ in range(renew._NODE_FORGET_AFTER):
+            renew.record_node_result("dead", False)
+        self.assertNotIn("dead", renew._load_node_stats())
+
+    def test_only_promotes_nodes_still_in_the_pool(self):
+        """订阅里节点会增减，记住的名字不一定还在、更不一定还测得通"""
+        renew.record_node_result("gone", True)
+        self.assertEqual(renew.prefer_known_good_nodes(["a", "b"]), ["a", "b"])
+
+    def test_no_history_changes_nothing(self):
+        pool = ["a", "b", "c"]
+        self.assertEqual(renew.prefer_known_good_nodes(pool), pool)
+
+    def test_survives_a_corrupt_file(self):
+        with open(renew.NODE_STATS_PATH, "w") as f:
+            f.write("{ not json")
+        self.assertEqual(renew.prefer_known_good_nodes(["a"]), ["a"])
+        renew.record_node_result("a", True)     # 坏文件也不该让记录失败
+        self.assertIn("a", renew._load_node_stats())
+
+    def test_file_is_capped(self):
+        for i in range(renew._NODE_STATS_MAX + 15):
+            renew.record_node_result(f"n{i}", True)
+        self.assertLessEqual(len(renew._load_node_stats()), renew._NODE_STATS_MAX)
+
+    def test_unnamed_node_is_ignored(self):
+        renew.record_node_result(None, True)    # 不走代理时 node_name 是 None
+        self.assertEqual(renew._load_node_stats(), {})
+
+    def test_survives_unwritable_state_dir(self):
+        patch_renew(self, NODE_STATS_PATH="/proc/nope/good_nodes.json",
+                    STATE_DIR="/proc/nope")
+        renew.record_node_result("a", True)     # 落盘失败不该中断整个流程
+
+
 class FakeExits:
     """按节点给出「连查两次出口 IP」的结果，用来模拟落地轮换
 

@@ -1,6 +1,8 @@
 output/
 # 会话凭据，绝不能提交（CI 里靠 actions/cache 跨运行传递）
 cookies/
+# 节点战绩，同样靠 actions/cache 跨运行传递，且带订阅里的节点名
+state/
 mihomo
 mihomo.log
 config.yaml

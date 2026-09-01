@@ -78,13 +78,19 @@ jobs:
       # 缓存 key 每次运行都不同 + restore-keys 前缀匹配，是因为缓存条目
       # 不可覆盖，只能「每次写新的、读最近的」。
       #
+      # state/ 里是节点战绩: cookie 总会过期，过期那次就得回到「从几百个
+      # 节点里随机摸一个能过 Turnstile 的」。记住上次过过的，就不用每次
+      # 从头付这笔试错成本。和 cookie 同一份缓存，它俩的生命周期一致。
+      #
       # cookie 是会话凭据。本仓库是 private，缓存只对本仓库的 workflow
       # 可见，且没有任何 pull_request 触发器，所以外部 PR 读不到它。
       # 一旦仓库转为 public，这一步要重新评估。
-      - name: Restore cookies
+      - name: Restore cookies and node stats
         uses: actions/cache/restore@v6
         with:
-          path: cookies
+          path: |
+            cookies
+            state
           key: katabump-cookies-${{ github.run_id }}
           restore-keys: |
             katabump-cookies-
@@ -96,12 +102,15 @@ jobs:
         run: |
           xvfb-run -a python -u renew.py
 
-      # 即使脚本失败也要存: 可能只是部分账号失败，成功那些的 cookie 依然有用
-      - name: Save cookies
+      # 即使脚本失败也要存: 可能只是部分账号失败，成功那些的 cookie 依然有用。
+      # 失败那次的节点战绩更要存 —— 「这些节点过不去」同样是有价值的信息。
+      - name: Save cookies and node stats
         if: always()
         uses: actions/cache/save@v6
         with:
-          path: cookies
+          path: |
+            cookies
+            state
           key: katabump-cookies-${{ github.run_id }}
 
       - name: Upload reports and screenshots
