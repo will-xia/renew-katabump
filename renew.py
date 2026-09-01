@@ -1139,21 +1139,108 @@ def js_fill_input(sb, selector: str, text: str):
     """)
 
 
-def _activate_window():
-    for cls in ["chrome", "chromium", "Chromium", "Chrome", "google-chrome"]:
-        try:
-            r = subprocess.run(["xdotool", "search", "--onlyvisible", "--class", cls], capture_output=True, text=True, timeout=3)
-            wids = [w for w in r.stdout.strip().split("\n") if w.strip()]
-            if wids:
-                subprocess.run(["xdotool", "windowactivate", "--sync", wids[0]], timeout=3, stderr=subprocess.DEVNULL)
-                time.sleep(0.2)
-                return
-        except Exception:
-            pass
+_CHROME_WINDOW_CLASSES = ("chrome", "chromium", "Chromium", "Chrome", "google-chrome")
+
+
+def _xdotool(*args, timeout: int = 5, quiet: bool = False) -> tuple:
+    """跑一条 xdotool 命令，返回 (是否成功, stdout)。
+
+    刻意**不吞**错误。之前每次调用都是 stderr→DEVNULL 且不看返回码，
+    于是 xdotool 因为 DISPLAY 不对/找不到窗口而一次都没点下去时，
+    日志照样一行行打「已点击 …视口→屏幕…」—— 32 次点击全打在空气上，
+    日志上看不出半点异常（run 33451554684 就是这么烧掉 8 分钟的）。
+
+    quiet: 「失败」本身就是预期结果之一时用（比如按窗口类名搜索，
+    没有 chromium 这个类名很正常）。噪音警告会把真正的警告淹掉。
+    """
+    cmd = ["xdotool"] + [str(a) for a in args]
     try:
-        subprocess.run(["xdotool", "getactivewindow", "windowactivate"], timeout=3, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        print("   ⚠️ 找不到 xdotool 命令（CI 里应由 apt 安装）")
+        return False, ""
+    except Exception as e:
+        print(f"   ⚠️ xdotool {args[0] if args else ''} 执行异常: {e}")
+        return False, ""
+    if getattr(r, "returncode", 0) != 0:
+        if not quiet:
+            err = (getattr(r, "stderr", "") or "").strip().replace("\n", " ")[:160]
+            print(f"   ⚠️ {' '.join(cmd)} 失败 (exit {r.returncode})"
+                  + (f": {err}" if err else ""))
+        return False, getattr(r, "stdout", "") or ""
+    return True, getattr(r, "stdout", "") or ""
+
+
+# 缓存 Chrome 的 X 窗口 id: 一次尝试内窗口不会变，而每次点击前都重扫
+# 一遍要跑十来个 xdotool 进程。换浏览器实例时由 _reset_window_cache 清掉。
+_WINDOW_ID_CACHE = None
+
+
+def _reset_window_cache():
+    global _WINDOW_ID_CACHE
+    _WINDOW_ID_CACHE = None
+
+
+def _chrome_window_geometry():
+    """向 X 直接问出 Chrome 窗口的真实位置和尺寸，取不到返回 None。
+
+    比 window.screenX/outerHeight 那套推算可靠: 那是**浏览器自报**的
+    位置，而 xvfb 里没有窗口管理器，自报值和窗口在屏幕上的实际位置
+    不保证一致 —— 一旦对不上，点击就稳定偏在别处，而且毫无迹象。
+    多个候选窗口时取面积最大的那个（小窗口通常是 Chrome 的辅助窗口）。
+    """
+    global _WINDOW_ID_CACHE
+    if _WINDOW_ID_CACHE:
+        geo = _window_geometry(_WINDOW_ID_CACHE)
+        if geo:
+            return geo
+        _WINDOW_ID_CACHE = None
+
+    best = None
+    for cls in _CHROME_WINDOW_CLASSES:
+        # 没有 chromium / Chromium 这些类名是常态，exit 1 不值得报警
+        ok, out = _xdotool("search", "--onlyvisible", "--class", cls, quiet=True)
+        if not ok:
+            continue
+        for wid in [w.strip() for w in out.split("\n") if w.strip()]:
+            g = _window_geometry(wid)
+            if g and (best is None or g["w"] * g["h"] > best["w"] * best["h"]):
+                best = g
+    if best:
+        _WINDOW_ID_CACHE = best["wid"]
+    return best
+
+
+def _window_geometry(wid):
+    """读单个 X 窗口的几何，读不到返回 None"""
+    ok, geo = _xdotool("getwindowgeometry", "--shell", wid)
+    if not ok:
+        return None
+    vals = {}
+    for line in geo.splitlines():
+        key, _, val = line.partition("=")
+        val = val.strip()
+        if val.lstrip("-").isdigit():
+            vals[key.strip().lower()] = int(val)
+    if not {"x", "y", "width", "height"} <= set(vals):
+        return None
+    return {"wid": wid, "x": vals["x"], "y": vals["y"],
+            "w": vals["width"], "h": vals["height"]}
+
+
+def _activate_window():
+    """把输入焦点给到 Chrome 窗口。
+
+    用 windowfocus 而不是 windowactivate: 后者走 EWMH 的
+    _NET_ACTIVE_WINDOW，需要窗口管理器配合，而 CI 的 Xvfb 里根本没有 WM，
+    调用必然失败。windowfocus 直接 XSetInputFocus，没有 WM 也能用。
+    """
+    geo = _chrome_window_geometry()
+    if geo:
+        _xdotool("windowfocus", geo["wid"])
+        time.sleep(0.2)
+        return True
+    return False
 
 
 # 取不到窗口信息时的兜底值（窗口按 set_window_size(1280, 900) 算，
@@ -1182,6 +1269,97 @@ def _to_screen_point(wininfo, vx, vy) -> tuple:
     return int(vx + dx), int(vy + dy)
 
 
+# 校准探针: 记录顶层文档最近一次收到的鼠标位置。
+#
+# 必须挂在**顶层文档**上，取样点也必须落在顶层文档的空白处 ——
+# 指针停在 Turnstile widget 上时顶层文档收不到任何鼠标事件（跨域 iframe
+# 自己吃掉了），拿它做取样只会得出「xdotool 没生效」的错误结论。
+_MOUSE_PROBE_JS = """
+(function(){
+    window.__probe = null;
+    if (!window.__probeOn) {
+        document.addEventListener('mousemove', function(e){
+            window.__probe = {cx: e.clientX, cy: e.clientY};
+        }, true);
+        window.__probeOn = true;
+    }
+    return true;
+})()
+"""
+
+_MOUSE_PROBE_READ_JS = "(function(){ return window.__probe || null; })()"
+
+# 实测出来的「视口 → 屏幕」偏移。None 表示还没测到，此时退回推算值。
+_CALIBRATED_OFFSET = None
+
+
+def _wininfo(sb):
+    try:
+        return _js(sb, _WININFO_JS)
+    except Exception:
+        return None
+
+
+def _calibrate_screen_offset(sb):
+    """实测「视口坐标 → 屏幕坐标」的偏移量，测不出返回 None。
+
+    做法: 把指针移到窗口内一个已知的屏幕点，再问页面它收到的
+    clientX/clientY 是多少 —— 两者相减就是偏移。
+
+    比原来的推算公式强在两点:
+      1. 偏移是量出来的，不依赖「浏览器自报的窗口位置是准的」这个假设；
+      2. 顺带证明了 xdotool 发出的事件**确实进得了浏览器**。第 2 点才是
+         关键 —— run 33451554684 里坐标算得分毫不差（截图上点位正落在
+         checkbox 正中），widget 却全程一动不动，说明事件压根没送达。
+         推算公式永远发现不了这种情况。
+    """
+    try:
+        _js(sb, _MOUSE_PROBE_JS)
+    except Exception as e:
+        print(f"   ⚠️ 鼠标校准探针安装失败: {e}")
+        return None
+
+    # DISPLAY 和屏幕尺寸一起打出来: xdotool 和浏览器不在同一个 X display 上
+    # 是「坐标全对、点击全无效」最省事的解释，而这两行足以一眼看穿。
+    ok, screen = _xdotool("getdisplaygeometry")
+    print(f"   DISPLAY={os.environ.get('DISPLAY') or '(未设置)'}"
+          f" 屏幕={' x '.join(screen.split()) if ok and screen.strip() else '未知'}")
+
+    geo = _chrome_window_geometry()
+    if geo:
+        print(f"   窗口实测几何: ({geo['x']},{geo['y']}) {geo['w']}x{geo['h']}")
+        # x 取窗口左边 100px: 登录卡片在页面正中，这一带是空白背景，
+        # 稳稳属于顶层文档；y 取窗口高度的几档比例，避开顶部工具栏。
+        samples = [(geo["x"] + 100, geo["y"] + int(geo["h"] * f))
+                   for f in (0.60, 0.45, 0.80)]
+    else:
+        dx, dy = _screen_offset(_wininfo(sb))
+        print(f"   ⚠️ 问不到窗口几何，用推算偏移 ({dx},{dy}) 取样")
+        samples = [(100 + dx, vy + dy) for vy in (400, 300, 500)]
+
+    for sx, sy in samples:
+        # 先挪开一点再挪到目标: 指针已经停在目标点上时 X 不会再发 motion，
+        # 探针也就永远读不到东西。
+        _xdotool("mousemove", "--sync", sx + 37, sy + 29)
+        time.sleep(0.1)
+        if not _xdotool("mousemove", "--sync", sx, sy)[0]:
+            return None
+        seen = _poll(lambda: _js(sb, _MOUSE_PROBE_READ_JS), 2, interval=0.25)
+        if seen and "cx" in seen:
+            off = (int(sx - seen["cx"]), int(sy - seen["cy"]))
+            print(f"   ✅ 指针校准: 屏幕({sx},{sy}) 对应视口"
+                  f"({seen['cx']},{seen['cy']}) → 偏移 {off}")
+            return off
+        try:
+            _js(sb, _MOUSE_PROBE_JS)   # 清掉读数，换下一个取样点
+        except Exception:
+            pass
+
+    print("   ⚠️ 指针校准失败: 移动指针后顶层文档没收到任何鼠标事件，"
+          "说明 xdotool 的事件没进到浏览器窗口")
+    return None
+
+
 def _xdotool_click(sb, vx, vy):
     """在**视口坐标** (vx, vy) 处做一次 OS 级点击。
 
@@ -1191,21 +1369,20 @@ def _xdotool_click(sb, vx, vy):
     调用方就不可能忘记 —— 之前换算靠调用方自觉，Turnstile 那条路径漏了，
     六次点击全部打在 widget 上方，日志还打得像模像样。
     """
-    wininfo = None
-    try:
-        wininfo = _js(sb, _WININFO_JS)
-    except Exception:
-        pass
-    x, y = _to_screen_point(wininfo, vx, vy)
-    print(f"   视口({vx:.0f},{vy:.0f}) → 屏幕({x},{y})")
+    if _CALIBRATED_OFFSET:
+        dx, dy = _CALIBRATED_OFFSET
+        x, y = int(vx + dx), int(vy + dy)
+        source = "实测"
+    else:
+        x, y = _to_screen_point(_wininfo(sb), vx, vy)
+        source = "推算"
+    print(f"   视口({vx:.0f},{vy:.0f}) → 屏幕({x},{y})（{source}偏移）")
 
     _activate_window()
-    try:
-        subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=3, stderr=subprocess.DEVNULL)
-        time.sleep(0.15)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
-    except Exception:
-        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+    if not _xdotool("mousemove", "--sync", x, y)[0]:
+        return False
+    time.sleep(0.15)
+    return _xdotool("click", "1")[0]
 
 # 定位 Turnstile widget 并返回其视口坐标。
 #
@@ -1244,6 +1421,7 @@ _TS_DIAG_JS = r"""
         has_input: !!i,
         token_len: i ? (i.value || '').length : -1,
         turnstile_api: typeof window.turnstile,
+        has_focus: document.hasFocus(),
         light_dom_iframes: [],
         cf_resources: []
     };
@@ -1377,6 +1555,12 @@ def _turnstile_diagnostics(sb, tag: str):
         print(f"     容器存在: {d.get('has_container')} rect={d.get('container_rect')}")
         print(f"     input 存在: {d.get('has_input')}, token 长度: {d.get('token_len')}, "
               f"window.turnstile: {d.get('turnstile_api')}")
+        # 这一行用来区分两种完全不同的失败:
+        #   实测偏移有值 = OS 点击进得了浏览器、落点也是量准的 →
+        #                  问题在 Cloudflare 侧（出口 IP 口碑/环境指纹）；
+        #   实测偏移 None = 指针事件压根没送达 → 再准的坐标也是白点。
+        print(f"     页面有焦点: {d.get('has_focus')}, "
+              f"实测视口→屏幕偏移: {_CALIBRATED_OFFSET}")
         print(f"     容器 HTML: {d.get('container_html')}")
         print(f"     普通 DOM 内 iframe ({len(d.get('light_dom_iframes') or [])} 个, "
               f"widget 在 closed shadow root 里，这里看不到是正常的):")
@@ -1419,18 +1603,35 @@ def _reset_turnstile(sb):
         print(f"⚠️ turnstile.reset() 调用异常: {e}")
 
 
-def handle_turnstile(sb) -> bool:
+def handle_turnstile(sb, on_reload=None) -> bool:
     """处理登录页的 Cloudflare Turnstile。
 
-    只走 xdotool 的 OS 级点击。SeleniumBase 那两个内置方法
+    优先走 xdotool 的 OS 级点击。SeleniumBase 那两个内置方法
     （uc_gui_click_cf / uc_gui_click_captcha）在这个页面上是纯空转:
     它们靠**普通 DOM 里的 iframe 选择器**定位 challenge，而这里
     document.querySelectorAll('iframe') 返回 0 个（widget 的 iframe 在
     shadow root 内），选择器命不中就静默 return，连异常都不抛。
     之前日志里那 12 次「尝试」实际一次都没点下去，纯粹浪费两分钟。
+
+    on_reload: 第 2 轮重载页面后的回调。重载会把已填好的表单清空，
+    调用方必须借此把邮箱/密码补回去 —— 否则就算 Turnstile 过了，
+    紧接着提交的也是一份空表单（run 33451554684 的截图正是这样:
+    验证框下面的两个输入框全空）。
     """
+    global _CALIBRATED_OFFSET
+
     print("🔍 处理 Cloudflare Turnstile 验证...")
     _ensure_connected(sb)
+
+    # 每次进来都重新校准: 换了一次尝试就是换了个浏览器实例，
+    # 窗口 id 和位置都不保证还是上次那个。
+    _reset_window_cache()
+    _CALIBRATED_OFFSET = _calibrate_screen_offset(sb)
+    click = _xdotool_click
+    if _CALIBRATED_OFFSET is None:
+        print("⚠️ OS 级点击送不进浏览器，改用 CDP 合成事件兜底"
+              "（Turnstile 对合成事件一向不买账，成功率低）")
+        click = _cdp_click
 
     for round_num in range(2):
         if round_num > 0:
@@ -1438,6 +1639,8 @@ def handle_turnstile(sb) -> bool:
             try:
                 sb.uc_open_with_reconnect(sb.get_current_url(), reconnect_time=10)
                 time.sleep(8)
+                if on_reload:
+                    on_reload()
             except Exception as e:
                 print(f"⚠️ 页面重载异常: {e}")
 
@@ -1452,9 +1655,9 @@ def handle_turnstile(sb) -> bool:
 
         last_attempt = len(_TS_CHECKBOX_X_OFFSETS) - 1
         for attempt, dx in enumerate(_TS_CHECKBOX_X_OFFSETS):
-            print(f"🖱️ xdotool 点击 Turnstile checkbox，"
+            print(f"🖱️ 点击 Turnstile checkbox，"
                   f"容器左偏移 {dx}px [尝试 {attempt + 1}]")
-            _xdotool_click(sb, box["x"] + dx, box["y"] + box["h"] / 2)
+            click(sb, box["x"] + dx, box["y"] + box["h"] / 2)
             # 模拟人类操作：点击后短暂停顿，让浏览器处理事件
             time.sleep(0.5 + (time.time() % 1) * 0.3)
 
@@ -1542,13 +1745,15 @@ def login(sb, email: str, password: str) -> bool:
     except Exception:
         pass
 
-    print(f"📧 填写邮箱...")
-    js_fill_input(sb, 'input[name="email"]', email)
-    time.sleep(0.3)
+    def _fill_credentials():
+        print(f"📧 填写邮箱...")
+        js_fill_input(sb, 'input[name="email"]', email)
+        time.sleep(0.3)
+        print("🔑 填写密码...")
+        js_fill_input(sb, 'input[name="password"]', password)
+        time.sleep(1)
 
-    print("🔑 填写密码...")
-    js_fill_input(sb, 'input[name="password"]', password)
-    time.sleep(1)
+    _fill_credentials()
 
     # 等待 Turnstile 验证框出现（最多 15 秒）
     print("⏳ 等待 Turnstile 验证框出现...")
@@ -1561,7 +1766,8 @@ def login(sb, email: str, password: str) -> bool:
         time.sleep(1)
 
     if ts_found:
-        if not handle_turnstile(sb):
+        # 第 2 轮会重载页面，输入框跟着清空，必须把凭据补回去
+        if not handle_turnstile(sb, on_reload=_fill_credentials):
             print("❌ 登录界面的 Turnstile 验证失败")
             return False
     else:

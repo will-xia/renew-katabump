@@ -13,6 +13,8 @@
 不需要浏览器/网络: seleniumbase 在本地通常没装，import 前先塞个假模块。
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -123,24 +125,44 @@ class TestTurnstileClickPoint(unittest.TestCase):
 
 
 class FakeSubprocess:
-    """够用的 subprocess 替身，把 xdotool 的目标坐标记下来
+    """够用的 subprocess 替身，模拟一台 X 服务器
 
-    _xdotool_click 内部自己做视口→屏幕换算，所以测试必须打在它**下面**
-    这一层，否则换算逻辑会被 mock 掉，等于没测。
+    _xdotool_click / _calibrate_screen_offset 内部自己做视口→屏幕换算，
+    所以测试必须打在它们**下面**这一层，否则换算逻辑会被 mock 掉，
+    等于没测。
+
+    window 为 None 时 `xdotool search` 返回空 —— 对应「找不到浏览器窗口」，
+    校准只能退回推算偏移。
     """
 
     DEVNULL = -3
+    WID = "12345"
 
-    def __init__(self, on_click):
+    def __init__(self, on_click, window=None, on_move=None, exit_code=0):
         self.on_click = on_click
+        self.on_move = on_move
+        self.window = window
+        self.exit_code = exit_code
         self.target = None
+        self.commands = []
 
     def run(self, args, **kwargs):
+        self.commands.append(list(args))
+        out = ""
         if args[:2] == ["xdotool", "mousemove"]:
             self.target = (int(args[-2]), int(args[-1]))
+            if self.on_move:
+                self.on_move(*self.target)
         elif args[:2] == ["xdotool", "click"] and self.target:
             self.on_click(*self.target)
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        elif args[1:2] == ["search"] and self.window:
+            out = self.WID + "\n"
+        elif args[1:2] == ["getwindowgeometry"] and self.window:
+            w = self.window
+            out = (f"WINDOW={self.WID}\nX={w['x']}\nY={w['y']}\n"
+                   f"WIDTH={w['w']}\nHEIGHT={w['h']}\n")
+        return types.SimpleNamespace(
+            returncode=self.exit_code, stdout=out, stderr="")
 
 
 class FakeClock:
@@ -180,18 +202,27 @@ class TurnstileHarness:
     """模拟一个「只有点在 checkbox 上才会通过」的 Turnstile
 
     数值取自实际失败日志: 容器 rect x=486 y=437 w=308 h=71，窗口 1280x900。
+
+    deliver=False 复现 run 33451554684 的真实故障: 坐标算得分毫不差，
+    但 xdotool 的事件根本没进到浏览器窗口 —— 指针探针读不到任何东西，
+    widget 也全程不动。
     """
 
-    BOX = {"x": 486, "y": 437, "w": 308, "h": 71, "vw": 1280, "vh": 900}
+    BOX = {"x": 486, "y": 437, "w": 308, "h": 71, "vw": 1280, "vh": 812}
     WININFO = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
+    # 窗口在屏幕上的真实几何 + 由此得到的真实「视口→屏幕」偏移
+    WINDOW = {"x": 0, "y": 0, "w": 1280, "h": 900}
+    OFFSET = (0, 88)
     # checkbox 在屏幕坐标系里的真实范围（已含 88px 工具栏偏移）
     CHECKBOX = {"x1": 499, "y1": 550, "x2": 515, "y2": 570}
 
-    def __init__(self, auto_pass=False, solvable=True):
+    def __init__(self, auto_pass=False, solvable=True, deliver=True):
         self.token = "x" * 40 if auto_pass else ""
         self.solvable = solvable
+        self.deliver = deliver
         self.clicks = []
         self.resets = 0
+        self.probe = None
 
     def js(self, sb, expression):
         expr = expression.strip()
@@ -203,6 +234,11 @@ class TurnstileHarness:
             return len(self.token)
         if expr == renew._WININFO_JS.strip():
             return dict(self.WININFO)
+        if expr == renew._MOUSE_PROBE_JS.strip():
+            self.probe = None
+            return True
+        if expr == renew._MOUSE_PROBE_READ_JS.strip():
+            return dict(self.probe) if self.probe else None
         if "turnstile.reset" in expr:
             self.resets += 1
             self.token = ""
@@ -211,8 +247,24 @@ class TurnstileHarness:
             return {"title": "Log in", "has_container": True, "token_len": 0}
         raise AssertionError(f"未预期的 JS 调用: {expr[:60]}")
 
+    def move(self, x, y):
+        """指针移到屏幕点 (x, y)，顶层文档据此记下 clientX/clientY"""
+        if not self.deliver:
+            return
+        dx, dy = self.OFFSET
+        cx, cy = x - dx, y - dy
+        if not (0 <= cx < self.BOX["vw"] and 0 <= cy < self.BOX["vh"]):
+            return                      # 落在视口外，页面收不到
+        b = self.BOX
+        if (b["x"] <= cx <= b["x"] + b["w"]
+                and b["y"] <= cy <= b["y"] + b["h"]):
+            return                      # widget 是跨域 iframe，事件不冒泡到顶层
+        self.probe = {"cx": cx, "cy": cy}
+
     def click(self, x, y):
         """收到的是屏幕坐标 —— 由 _xdotool_click 真实换算得出"""
+        if not self.deliver:
+            return
         self.clicks.append((x, y))
         cb = self.CHECKBOX
         if self.solvable and cb["x1"] <= x <= cb["x2"] and cb["y1"] <= y <= cb["y2"]:
@@ -225,20 +277,22 @@ class TurnstileHarness:
 
 
 class TestHandleTurnstile(unittest.TestCase):
-    """handle_turnstile 端到端（无浏览器），含真实的坐标换算"""
+    """handle_turnstile 端到端（无浏览器），含真实的坐标换算与指针校准"""
 
-    def _run(self, harness):
+    def _run(self, harness, on_reload=None, cdp=None):
         sb = FakeBrowser()
         patch_renew(
             self,
             _js=harness.js,
             _ensure_connected=lambda sb: None,
             _save_artifacts=lambda sb, tag: None,
-            _activate_window=lambda: None,
-            subprocess=FakeSubprocess(harness.click),
+            _CALIBRATED_OFFSET=None,
+            subprocess=FakeSubprocess(
+                harness.click, window=harness.WINDOW, on_move=harness.move),
             time=FakeClock(),
+            **({"_cdp_click": cdp} if cdp else {}),
         )
-        return renew.handle_turnstile(sb), sb
+        return renew.handle_turnstile(sb, on_reload=on_reload), sb
 
     def test_clicks_land_on_checkbox_and_pass(self):
         harness = TurnstileHarness()
@@ -253,6 +307,19 @@ class TestHandleTurnstile(unittest.TestCase):
         self._run(harness)
         self.assertEqual(len(harness.clicks), 1,
                          f"第一次点击就该成功，实际点了 {len(harness.clicks)} 次")
+
+    def test_calibration_measures_the_real_offset(self):
+        """偏移必须是量出来的，而且要量准"""
+        harness = TurnstileHarness()
+        self._run(harness)
+        self.assertEqual(renew._CALIBRATED_OFFSET, harness.OFFSET)
+
+    def test_calibration_avoids_sampling_on_the_widget(self):
+        """取样点落在 widget 上就永远读不到数 —— widget 是跨域 iframe"""
+        harness = TurnstileHarness()
+        self._run(harness)
+        self.assertIsNotNone(renew._CALIBRATED_OFFSET,
+                             "取样点选在了 widget 上，顶层文档收不到事件")
 
     def test_auto_pass_skips_clicking(self):
         harness = TurnstileHarness(auto_pass=True)
@@ -275,6 +342,30 @@ class TestHandleTurnstile(unittest.TestCase):
         # 每轮 4 次点击只在前 3 次后 reset → 2 轮共 6 次
         self.assertEqual(harness.resets, 6)
 
+    def test_reload_refills_the_form(self):
+        """重载会清空邮箱/密码，必须靠 on_reload 补回来
+
+        少了这一步，就算第 2 轮把 Turnstile 过了，紧接着提交的也是
+        一份空表单 —— run 33451554684 的截图正是这样。
+        """
+        harness = TurnstileHarness(solvable=False)
+        refills = []
+        _, sb = self._run(harness, on_reload=lambda: refills.append(1))
+        self.assertEqual(sb.reloads, 1)
+        self.assertEqual(len(refills), 1, "重载后没有重新填表单")
+
+    def test_undeliverable_clicks_fall_back_to_cdp(self):
+        """OS 点击进不了浏览器时，别再对着空气点满 8 次"""
+        harness = TurnstileHarness(solvable=False, deliver=False)
+        cdp_calls = []
+        ok, _ = self._run(
+            harness, cdp=lambda sb, x, y: cdp_calls.append((x, y)))
+        self.assertFalse(ok)
+        self.assertIsNone(renew._CALIBRATED_OFFSET,
+                          "事件送不达时不该报出一个「实测」偏移")
+        self.assertTrue(cdp_calls, "校准失败后没有退回 CDP 兜底")
+        self.assertEqual(harness.clicks, [])
+
 
 class TestXdotoolClickConvertsCoordinates(unittest.TestCase):
     """_xdotool_click 必须自己完成视口→屏幕换算
@@ -285,7 +376,7 @@ class TestXdotoolClickConvertsCoordinates(unittest.TestCase):
 
     WININFO = {"sx": 0, "sy": 0, "oh": 900, "ih": 812}
 
-    def _click(self, wininfo, vx, vy):
+    def _click(self, wininfo, vx, vy, calibrated=None):
         got = []
         harness = types.SimpleNamespace(
             js=lambda sb, expr: dict(wininfo) if wininfo else None)
@@ -293,6 +384,7 @@ class TestXdotoolClickConvertsCoordinates(unittest.TestCase):
             self,
             _js=harness.js,
             _activate_window=lambda: None,
+            _CALIBRATED_OFFSET=calibrated,
             subprocess=FakeSubprocess(lambda x, y: got.append((x, y))),
             time=FakeClock(),
         )
@@ -307,6 +399,41 @@ class TestXdotoolClickConvertsCoordinates(unittest.TestCase):
         (x, y), = self._click(None, 507, 472)
         self.assertEqual(x, 507)
         self.assertGreater(y, 472, "没有窗口信息时也必须加上兜底的工具栏偏移")
+
+    def test_measured_offset_beats_the_estimate(self):
+        """实测偏移在手时就不该再用推算值 —— 推算值可能整个是错的"""
+        self.assertEqual(
+            self._click(self.WININFO, 507, 472, calibrated=(20, 141)),
+            [(527, 613)])
+
+
+class TestXdotoolReportsFailure(unittest.TestCase):
+    """xdotool 失败必须出声
+
+    原来 stderr 全进 DEVNULL 且不看返回码，DISPLAY 不对时 32 次点击
+    一次都没落地，日志却一行「异常」都没有。
+    """
+
+    def _run(self, exit_code):
+        patch_renew(
+            self,
+            subprocess=FakeSubprocess(lambda x, y: None, exit_code=exit_code),
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok, _ = renew._xdotool("mousemove", "--sync", 1, 2)
+        return ok, buf.getvalue()
+
+    def test_nonzero_exit_is_reported(self):
+        ok, printed = self._run(1)
+        self.assertFalse(ok)
+        self.assertIn("失败", printed, "xdotool 失败却没有任何输出")
+        self.assertIn("mousemove", printed, "没说清是哪条命令失败")
+
+    def test_success_is_quiet(self):
+        ok, printed = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(printed, "")
 
 
 class FakeMihomo:
