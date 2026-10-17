@@ -1,4 +1,4 @@
-Katabump Renewer
+Renew KB
 
 USERS_JSON：
 [
